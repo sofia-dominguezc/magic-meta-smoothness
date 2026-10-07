@@ -49,13 +49,12 @@ def eval_loss(
 
 @dataclass(kw_only=True)
 class OptimState:
-    """General class for model + optimizer states"""
+    """General class containing all model + optimizer states"""
 
     params: dict[str, Tensor]  # model parameters
 
     @property
-    def _state_tensors(self) -> dict[str, dict[str, Tensor]]:
-        """All state tensors. Updated in `step`, and are differentiable."""
+    def state_tensors(self) -> dict[str, dict[str, Tensor]]:
         tensor_fields: dict[str, dict[str, Tensor]] = {}
         for field in fields(self):
             if isinstance(tensor_dict := getattr(self, field.name), dict):
@@ -64,19 +63,27 @@ class OptimState:
 
     @property
     def all_tensors(self) -> list[Tensor]:
+        """Return all state tensors as a flattened list"""
         all_tensors: list[Tensor] = []
-        for _, tensor_dict in self._state_tensors.items():
+        for _, tensor_dict in self.state_tensors.items():
             all_tensors.extend(tensor_dict.values())
         return all_tensors
 
     def apply(self, fn: Callable[[Tensor], Tensor]) -> Self:
+        """Apply `fn` to each state tensor. Returns a new OptimState"""
         new_fields = {
             field_name: {name: fn(tensor) for name, tensor in tensor_dict.items()}
-            for field_name, tensor_dict in self._state_tensors.items()
+            for field_name, tensor_dict in self.state_tensors.items()
         }
         return replace(self, **new_fields)
 
+    def unflatten(self, tensors: list[Tensor]) -> Self:
+        """Inverse of `all_tensors`: a state like this one holding `tensors` instead"""
+        it = iter(tensors)
+        return self.apply(lambda _: next(it))
+
     def step(self, grads: dict[str, Tensor]) -> Self:
+        """Update state tensors. Returns a new OptimState"""
         raise NotImplementedError
 
 
@@ -105,12 +112,12 @@ class SGDMomentumState(SGDState):
     def step(self, grads: dict[str, Tensor]) -> Self:  # same as torch.optim.SGD (dampening=0, nesterov=False)
         assert self.buffer is not None
         new_buffer = {
-            name: self.momentum * ewma_p + g + self.weight_decay * p
-            for name, (p, ewma_p, g) in dict_zip(self.params, self.buffer, grads).items()
+            name: self.momentum * buf + g + self.weight_decay * p
+            for name, (p, buf, g) in dict_zip(self.params, self.buffer, grads).items()
         }
         new_params = {
-            name: p - self.lr * ewma_p
-            for name, (p, ewma_p) in dict_zip(self.params, new_buffer).items()
+            name: p - self.lr * buf
+            for name, (p, buf) in dict_zip(self.params, new_buffer).items()
         }
         return replace(self, params=new_params, buffer=new_buffer)
 
@@ -129,26 +136,22 @@ def train(
     ckpt_every: int | None = None,
     logger: Logger | None = None,
     eval_loader: EvalLoader | None = None,
-    eval_every: int = 0,
+    eval_every: int = 100,
     num_top_eigs: int = 0,
     progress: bool = True,
 ) -> tuple[OptimState, list[OptimState]]:
     """Train deterministically on steps [start, start + n_steps).
     Returns the final state and the states before steps start, start + ckpt_every, ...
 
-    If `eval_loader` is given, logs its loss and metrics every `eval_every` steps and at the end.
+    Optionally logs metrics of interest, including the top Hessian eigenvalues.
     """
-    if eval_loader is not None:
-        assert logger is not None and eval_every > 0
-    if num_top_eigs > 0:
+    if eval_loader is not None or num_top_eigs > 0:
         assert logger is not None
 
     def eval_log(step: int, state: OptimState):
-        if eval_loader is None or (step % eval_every != 0 and step != start + n_steps):
-            return
-        assert logger is not None
+        assert logger is not None and eval_loader is not None
         loss, metrics, _ = eval_loss(model, loss_fn, state.params, eval_loader)
-        logger.log(step, eval_loss=loss, **{f"eval_{k}": v for k, v in metrics.items()})
+        logger.log(step, **{"eval/loss": loss}, **{f"eval/{k}": v for k, v in metrics.items()})
 
     state = init_state.apply(lambda t: t.to(loader.device, non_blocking=True))
     ckpts: list[OptimState] = []
@@ -171,30 +174,34 @@ def train(
         if num_top_eigs > 0:
             assert logger is not None
             sizes = [p.numel() for p in params.values()]
+            grads_list = list(grads.values())
 
-            def hvp(V: Tensor) -> Tensor:  # [P, r] -> [P, r]
+            def hvp(V: Tensor) -> Tensor:  # (#params, #eig) -> (#params, #eig)
                 cols = []
                 for v in V.unbind(1):
                     vs = [c.view_as(p) for c, p in zip(v.split(sizes), params.values())]
-                    hv = torch.autograd.grad(
-                        list(grads.values()), params, vs, retain_graph=True
-                    )
+                    hv = torch.autograd.grad(grads_list, params, vs, retain_graph=True)
                     cols.append(torch.cat([h.flatten() for h in hv.values()]))
                 return torch.stack(cols, 1)
 
             if eigvecs is None:
+                logger.labels["eig"] = [f"eig {i + 1}" for i in range(num_top_eigs)]
                 g = torch.Generator().manual_seed(start)
                 eigvecs = torch.randn(
                     sum(sizes), num_top_eigs, generator=g
                 ).to(loader.device, non_blocking=True)
-            eigvals, eigvecs = torch_lobpcg(hvp, eigvecs)
-            logger.log(t, eigvals=eigvals)
+            eigvals, next_eigvecs, n_iter = torch_lobpcg(hvp, eigvecs)
+            logger.log(t, **{"eig/values": eigvals, "eig/lobpcg_iters": torch.tensor(n_iter)})
+            logger.log(t, **{"eig/cos_to_next": (eigvecs * next_eigvecs).sum(0).abs()})
+            eigvecs = next_eigvecs
             grads = {name: g.detach() for name, g in grads.items()}
 
-        eval_log(t, state)
+        if eval_loader is not None and t % eval_every == 0:
+            eval_log(t, state)
         state = state.step(grads)
 
-    eval_log(start + n_steps, state)
+    if eval_loader is not None:
+       eval_log(start + n_steps, state)
     return state, ckpts
 
 
@@ -228,21 +235,31 @@ def magic(
     init_state: OptimState,
     n_steps: int,
     eval_loaders: list[EvalLoader],
+    logger: Logger | None = None,
+    eval_names: list[str] | None = None,
+    num_top_betas: int = 4,
 ) -> tuple[list[Tensor], list[Tensor]]:
     """Run MAGIC for the eval functions "mean loss over the examples of each eval loader".
     Computational cost: `3 + #fns` trainings.
     Max memory usage: `sqrt(T) + #fns` model states.
 
+    If `logger` is given, logs at each step t (going backward from T):
+    - "delta/<field>": the RMS of df/ds_t restricted to each tensor dict of the state (e.g.
+      params, buffer), one entry per eval fn;
+    - "betas/top <k> df/dw, <eval name>": the k = `num_top_betas` largest |df/dw| accumulated over
+      the steps >= t, by rank, with their training example indices (same key + "_ids").
+
     Returns (list of f(s_T), list of df(s_T)/dw)
     """
+    eval_names = eval_names or [f"eval fn {i + 1}" for i in range(len(eval_loaders))]
     if len(eval_loaders) == 0:
         return [], []
-    all_states = reversed_states(  # 2x training
-        model, loader, loss_fn, init_state, n_steps=n_steps
-    )
+    all_states = reversed_states(model, loader, loss_fn, init_state, n_steps=n_steps)
+    final_state = next(all_states)  # (in device)  # 1x training
 
-    final_state = next(all_states)
     zero_state = final_state.apply(lambda t: torch.zeros_like(t))
+    if logger is not None:
+        logger.labels["betas"] = [f"top {j + 1}" for j in range(num_top_betas)]
     outputs: list[Tensor] = []       # f(s_t)
     deltas: list[list[Tensor]] = []  # df/ds_t (as a flattened OptimState)
     betas: list[Tensor] = []         # df/dw
@@ -254,21 +271,22 @@ def magic(
         deltas.append(replace(zero_state, params=f_grad).all_tensors)
         betas.append(torch.zeros(len(loader.dataset), device=loader.device))
 
-    for t, state in zip(reversed(range(n_steps)), tqdm(all_states, total=n_steps)):
+    t = n_steps - 1
+    for state in tqdm(all_states, total=n_steps):  # 1x training
         X, Y, indices, weights = loader.get(t)
         weights = weights.requires_grad_()
         state = state.apply(
             lambda t: t.to(loader.device, non_blocking=True).detach().requires_grad_()
         )
 
-        logits: Tensor = functional_call(model, state.params, (X,))  # 1x forward
+        logits: Tensor = functional_call(model, state.params, (X,))  # 1x fwd
         loss = (weights * loss_fn(logits, Y)).mean()
-        grads = torch.autograd.grad(loss, state.params, create_graph=True)  # 1x backward
+        grads = torch.autograd.grad(loss, state.params, create_graph=True)  # 1x bwd
         new_state = state.step(grads)
 
         for i, delta in enumerate(deltas):
             # (df/ds_t, df/dw_t) = ds_{t+1} / d(s_t, w_t) @ df/ds_{t+1}
-            *d_state, d_weights = torch.autograd.grad(  # 1x double-backward per `delta`
+            *d_state, d_weights = torch.autograd.grad(  # 1x double-bwd per `delta`
                 new_state.all_tensors,
                 [*state.all_tensors, weights],
                 delta,
@@ -276,5 +294,20 @@ def magic(
             )
             deltas[i] = d_state
             betas[i].index_add_(0, indices, d_weights)
+
+        if logger is not None:
+            delta_states = [state.unflatten(delta) for delta in deltas]
+            for name in state.state_tensors:
+                rms = torch.stack([
+                    (sum(d.pow(2).sum() for d in ds.state_tensors[name].values())
+                     / sum(d.numel() for d in ds.state_tensors[name].values())) ** 0.5
+                    for ds in delta_states
+                ])
+                logger.log(t, **{f"delta/{name}": rms})
+            for eval_name, beta in zip(eval_names, betas):
+                ids = beta.abs().topk(min(num_top_betas, len(beta))).indices
+                key = f"betas/top {num_top_betas} df/dw, {eval_name}"
+                logger.log(t, **{key: beta[ids], f"{key}_ids": ids})
+        t -= 1
 
     return outputs, betas

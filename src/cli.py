@@ -14,13 +14,12 @@ from pathlib import Path
 import click
 import matplotlib.pyplot as plt
 import torch
+from tqdm import tqdm
 
 from src.data import DATASETS, Dataset, EvalLoader, Loader, Subset
 from src.magic import LOSSES, OptimState, SGDMomentumState, SGDState, eval_loss, magic, train
 from src.models import CNN, MLP
 from src.utils import Logger, plot_scatter_grid
-
-DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -63,7 +62,7 @@ _CONFIG_OPTIONS = [
     click.option("--ckpt-frac", type=float, default=0.25, show_default=True, help="checkpoint every this fraction of training"),
     click.option("--drop-frac", type=float, default=0.05, show_default=True, help="fraction of the (label's) training examples each retrained model drops"),
     click.option("--out-dir", type=click.Path(path_type=Path), default=Path("./results"), show_default=True),
-    click.option("--device", type=str, default=DEFAULT_DEVICE, show_default=True),
+    click.option("--device", type=str, default="cpu", show_default=True),
 ]
 
 
@@ -119,7 +118,7 @@ def main():
 @click.option("--labels", type=str, default="all", callback=parse_labels, help="comma-separated labels, 'all' = any class")
 @click.option("--n-seeds", type=int, default=10, show_default=True)
 @click.option("--seed0", type=int, default=0, show_default=True, help="subset seeds are seed0, ..., seed0 + n_seeds - 1")
-@click.option("--full/--no-full", default=False, help="also train the full model (no data dropped) into <out-dir>/model_states, with logging")
+@click.option("--full/--no-full", default=True, help="also train the full model (no data dropped) into <out-dir>/model_states, with logging")
 @click.option("--num-top-eigs", type=int, default=0, show_default=True, help="full model only: log the top Hessian eigenvalues (slow)")
 @click.option("--eval-every", type=int, default=None, help="full model only: log the test loss and metrics every this many steps (default: ckpt_every, 0: never)")
 @click.option("--wandb", "wandb_project", type=str, default=None, help="full model only: wandb project to log to")
@@ -131,34 +130,36 @@ def train_subsets(labels, n_seeds, seed0, full, num_top_eigs, eval_every, wandb_
     cfg, out_dir, device, train_ds, test_ds, model, init_state = setup(kwargs)
     eval_every = cfg.ckpt_every if eval_every is None else eval_every
     subsets = [Subset(frac=cfg.drop_frac, label=label, seed=seed0 + s) for label in labels for s in range(n_seeds)]
-    runs: list[tuple[Path, Subset | None]] = [(out_dir / "model_states", None)] if full else []
-    for s in subsets:
-        runs.append((out_dir / "runs" / f"{'all' if s.label is None else s.label}_{s.seed}", s))
 
-    for i, (run_dir, subset) in enumerate(runs):
-        name = "full model" if subset is None else str(subset)
+    def train_and_save(run_dir: Path, subset: Subset | None, logger: Logger | None = None):
+        """Train dropping `subset` (None: no data dropped), with a per-step progress bar if logged."""
         run_dir.mkdir(parents=True, exist_ok=True)
-        click.echo(f"[{i + 1}/{len(runs)}] training {name}")
         weights = None if subset is None else (~subset.mask(train_ds)).float()
         loader = Loader(train_ds, cfg.batch_size, seed=cfg.data_seed, weights=weights, device=device)
-        logged = subset is None
-        logger = Logger(wandb_project, name, asdict(cfg)) if logged else None
         final, ckpts = train(
             model, loader, LOSSES[cfg.loss], init_state,
             n_steps=cfg.n_steps, ckpt_every=cfg.ckpt_every, logger=logger,
-            eval_loader=EvalLoader(test_ds, device=device) if logged and eval_every else None,
-            eval_every=eval_every if logged else 0, num_top_eigs=num_top_eigs if logged else 0,
+            eval_loader=EvalLoader(test_ds, device=device) if logger is not None and eval_every else None,
+            eval_every=eval_every, num_top_eigs=num_top_eigs if logger is not None else 0,
+            progress=logger is not None,
         )
         for j, state in enumerate([*ckpts, final]):
             ckpt_num = min(j * cfg.ckpt_every, cfg.n_steps)
             torch.save(asdict(state.apply(lambda t: t.cpu())), run_dir / f"ckpt_{ckpt_num}.pt")
         if subset is not None:
             (run_dir / "subset.json").write_text(json.dumps(asdict(subset)))
-        if logger is not None:
-            logger.finish(run_dir / "metrics.pt")
-            if show:
-                plt.show()
-            plt.close("all")
+
+    if full:
+        click.echo("training the full model")
+        logger = Logger(wandb_project, "full model", asdict(cfg))
+        train_and_save(out_dir / "model_states", None, logger)
+        logger.finish(out_dir / "model_states" / "metrics.pt")
+        if show:
+            plt.show()
+        plt.close("all")
+    for s in tqdm(subsets, desc="retrained models"):
+        dropped = "all_labels" if s.label is None else f"label_{s.label}"
+        train_and_save(out_dir / "runs" / f"drop_{dropped}_seed_{s.seed}", s)
 
 
 @main.command(help="Train on all the data and compute df/dw (MAGIC) for the loss on each eval subset, at step `--step`.")
@@ -168,7 +169,8 @@ def train_subsets(labels, n_seeds, seed0, full, num_top_eigs, eval_every, wandb_
 @click.option("--frac", type=float, default=0.1, show_default=True, help="fraction of the test set (or label's examples) in each eval subset")
 @click.option("--n-seeds", type=int, default=1, show_default=True)
 @click.option("--seed0", type=int, default=0, show_default=True, help="subset seeds are seed0, ..., seed0 + n_seeds - 1")
-def run_magic(step, labels, frac, n_seeds, seed0, **kwargs):
+@click.option("--show/--no-show", default=True)
+def run_magic(step, labels, frac, n_seeds, seed0, show, **kwargs):
     cfg, out_dir, device, train_ds, test_ds, model, init_state = setup(kwargs)
     step = cfg.n_steps if step is None else step
     magic_dir = out_dir / "magic" / f"step_{step}"
@@ -176,10 +178,22 @@ def run_magic(step, labels, frac, n_seeds, seed0, **kwargs):
 
     subsets = [Subset(frac=frac, label=label, seed=seed0 + s) for label in labels for s in range(n_seeds)]
     eval_loaders = [EvalLoader(test_ds, s.mask(test_ds).nonzero()[:, 0], device=device) for s in subsets]
+    test_names = ["test set" if s.label is None else f"test label {s.label}" for s in subsets]
+    logger = Logger(name=f"MAGIC at step {step}, train drop {cfg.drop_frac:.0%}")
+    logger.labels["delta"] = test_names  # one color per test label
+    logger.ncols["betas"] = n_seeds  # one row per test label, one column per seed
+    logger.ylabels["delta"] = "RMS of df/ds_t"
     outputs, betas = magic(
         model, Loader(train_ds, cfg.batch_size, seed=cfg.data_seed, device=device), LOSSES[cfg.loss], init_state, step,
-        eval_loaders,
+        eval_loaders, logger=logger, eval_names=[f"{name}, seed {s.seed}" for name, s in zip(test_names, subsets)],
     )
+    logger.finish(magic_dir / "metrics.pt", separate={
+        "delta": f"eval loss on {n_seeds} different {frac:.0%} subsets of each test label",
+        "betas": f"eval loss on {frac:.0%} of each test label (numbers: train example index)",
+    })
+    if show:
+        plt.show()
+    plt.close("all")
 
     outputs_cpu, betas_cpu = torch.stack(outputs).cpu(), torch.stack(betas).cpu()  # [n_fns], [n_fns, N]
     torch.save({"outputs": outputs_cpu, "betas": betas_cpu}, magic_dir / "linearization.pt")
@@ -203,13 +217,14 @@ def evaluate(step, show, **kwargs):
     eval_loaders = [EvalLoader(test_ds, s.mask(test_ds).nonzero()[:, 0], device=device) for s in subsets]
 
     run_dirs = [d for d in (out_dir / "runs").glob("*") if (d / f"ckpt_{step}.pt").exists()]
-    run_dirs.sort(key=lambda d: [-1 if x == "all" else int(x) for x in d.name.split("_")])  # <label>_<seed>, "all" first
+    run_subsets = {d: Subset(**json.loads((d / "subset.json").read_text())) for d in run_dirs}
+    run_dirs.sort(key=lambda d: (run_subsets[d].label is not None, run_subsets[d].label or 0, run_subsets[d].seed))  # "all" first
     if not run_dirs:
         raise click.UsageError(f"no retrained runs with a checkpoint at step {step} in {out_dir / 'runs'}")
     click.echo(f"evaluating {len(subsets)} eval subsets on {len(run_dirs)} retrained models at step {step}")
     preds, reals, groups = [], [], []
     for run_dir in run_dirs:
-        dropped = Subset(**json.loads((run_dir / "subset.json").read_text()))
+        dropped = run_subsets[run_dir]
         params = torch.load(run_dir / f"ckpt_{step}.pt", weights_only=True)["params"]
         params = {k: p.to(device) for k, p in params.items()}
         # f(w) ~ f(1) + betas @ (w - 1), with w = 0 on the dropped examples

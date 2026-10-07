@@ -8,32 +8,31 @@ https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L1
 """
 
 def torch_lobpcg(
-    A: Callable[[torch.Tensor], torch.Tensor], X: torch.Tensor, max_iter=100, tol=None
-) -> tuple[torch.Tensor, torch.Tensor]:
+    A: Callable[[torch.Tensor], torch.Tensor], X: torch.Tensor, max_iter=100, rtol=1e-3
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Finds the top k eigenvalues/eigenvectors of the n x n linear operator A.
 
     Args:
-      A (Callable: Array -> Array): function representing an [n x n] linear operator. 
+      A (Callable: Array -> Array): function representing an [n x n] linear operator.
         Passing in an [n x r] input should return an [n x r] output where A has
         been evaluated on each column of the input.
       X (Array): an initial guess for the top k eigenvectors, of shape [n x k].  This is
         how the function learns what k is.
       max_iter (int): the maximum number of LOBPCG iterations to run
-      tol (float): the numerical tolerance
+      rtol (float): column i has converged when its residual ||A x_i - theta_i x_i|| is below
+        rtol * max_j |theta_j|, so each theta_i is within that of a true eigenvalue
 
     Returns:
       top eigenvalues [k]
       top eigenvectors [n x k]
+      number of iterations run (max_iter if it didn't converge)
     """
     n, k = X.shape
 
     if n < 4 * k:
         A_mat = A(torch.eye(n, dtype=X.dtype, device=X.device))
         evals, evecs = _eigh_ascending(A_mat)
-        return evals[:k], evecs[:, :k]
-
-    if tol is None:
-        tol = torch.finfo(X.dtype).eps
+        return evals[:k], evecs[:, :k], 0
 
     X = _orthonormalize(X)
     P = _extend_basis(X, X.shape[1])
@@ -41,9 +40,9 @@ def torch_lobpcg(
     theta = torch.sum(X * AX, dim=0, keepdim=True)
     R = AX - theta * X
     converged = 0
-    for i in range(max_iter):
-        if converged >= k:
-            break
+    n_iter = 0
+    while converged < k and n_iter < max_iter:
+        n_iter += 1
         R = _project_out(torch.cat((X, P), dim=1), R)
         XPR = torch.cat((X, P, R), dim=1)
         theta, Q = _rayleigh_ritz_orth(A, XPR)
@@ -62,10 +61,9 @@ def torch_lobpcg(
         AX = A(X)
         R = AX - theta[None, :] * X
         resid_norms = torch.linalg.norm(R, ord=2, dim=0)
-        reltol = 10 * n * (torch.linalg.norm(AX, ord=2, dim=0) + theta)
-        res_converged = resid_norms < tol * reltol
+        res_converged = resid_norms < rtol * (torch.linalg.norm(AX, ord=2, dim=0) + theta)
         converged = torch.sum(res_converged)
-    return theta, X
+    return theta, X, n_iter
 
 
 def _project_out(basis, U):

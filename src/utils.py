@@ -34,6 +34,11 @@ class Logger:
             self.wandb_run = wandb.init(project=wandb_project, name=name, config=config)
         self._buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)
         self._history: dict[str, list[tuple[list[int], Tensor]]] = defaultdict(list)  # (steps, values) per flush
+        # by key or group: legend names of the entries of vector metrics (default 1, 2, ...), where
+        # entries with the same name share a color; the number of panels per row (default 3); y labels
+        self.labels: dict[str, list[str]] = {}
+        self.ncols: dict[str, int] = {}
+        self.ylabels: dict[str, str] = {}
 
     def log(self, step: int, **values: Tensor):
         for k, v in values.items():
@@ -53,44 +58,77 @@ class Logger:
             for s in sorted(per_step):
                 self.wandb_run.log(per_step[s], step=s)
 
-    def finish(self, path: Path):
+    def finish(self, path: Path, separate: dict[str, str] | None = None):
         """Save the logged metrics to `path` as {name: {"step": [n], "value": [n, ...]}} and plot
-        them (one panel per quantity) next to it."""
+        them next to it: one row (or more) per group "<group>/<name>", with the train metrics
+        (no group) first, then eval, then the others in logging order.
+        With `separate` ({group: title}), each of these groups goes to its own file `<path>_<group>.png`
+        instead, titled "<name>: <title>".
+        A key "<name>_ids" gives ids for <name>'s entries (e.g. dataset indices), written on the
+        lines wherever they change."""
         self.flush()
         metrics = {
             k: {"step": torch.tensor([s for steps, _ in v for s in steps]), "value": torch.cat([vals for _, vals in v])}
             for k, v in self._history.items()
         }
         torch.save(metrics, path)
-        # one row per kind: train metrics, eval metrics, then vector-valued ones (e.g. eigenvalues)
-        order = lambda k: (metrics[k]["value"].ndim > 1, k.startswith("eval_"))
-        names = sorted(metrics, key=order)
-        ncols = min(len(names), 3)
-        nrows = -(-len(names) // ncols)
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows), squeeze=False)
-        for ax in axes.flat[len(names) :]:
-            fig.delaxes(ax)
-        alpha = 1 - 2 ** (-1 / 10)  # EMA with a half-life of 10 steps
-        for ax, name in zip(axes.flat, names):
-            m = metrics[name]
-            steps, arr = m["step"].numpy(), m["value"].numpy()
-            if arr.ndim > 1:  # e.g. eigenvalues: one line per entry
-                ax.plot(steps, arr, label=[str(i) for i in range(arr.shape[1])])
-            elif np.all(np.diff(steps) == 1):  # logged every step: smooth it
-                ema = arr.copy()
-                for i in range(1, len(ema)):
-                    ema[i] = alpha * arr[i] + (1 - alpha) * ema[i - 1]
-                ax.plot(steps, arr, alpha=0.4, label="raw")
-                ax.plot(steps, ema, label="EMA")
-            else:  # e.g. evaluations every few steps
-                ax.plot(steps, arr, "o-", label="raw")
-            ax.legend(fontsize=7)
-            ax.set(title=name, xlabel="step")
-        fig.suptitle(self.name)
-        fig.tight_layout()
-        fig.savefig(path.with_suffix(".png"), dpi=150)
+
+        groups: dict[str, list[str]] = {"": [], "eval": []}
+        for k in metrics:
+            if not k.endswith("_ids"):
+                groups.setdefault(k.split("/")[0] if "/" in k else "", []).append(k)
+        if separate is None:
+            figures = [(path.with_suffix(".png"), self.name, list(groups.values()))]
+        else:
+            figures = [(path.with_name(f"{path.stem}_{g}.png"), f"{self.name}: {t}", [groups[g]]) for g, t in separate.items()]
+        for out_path, title, figure_groups in figures:
+            self._plot(metrics, figure_groups, title, out_path, strip_group=separate is not None)
         if self.wandb_run is not None:
             self.wandb_run.finish()
+
+    def _plot(self, metrics: dict, groups: list[list[str]], title: str, out_path: Path, strip_group: bool):
+        group_of = lambda name: name.split("/")[0] if "/" in name else ""
+        rows = []
+        for names in groups:
+            n = self.ncols.get(group_of(names[0]), 3) if names else 3
+            rows += [names[i : i + n] for i in range(0, len(names), n)]
+        ncols = max(map(len, rows))
+        width, height = (6.5, 4.6) if ncols <= 2 else (4.5, 3.4)  # few panels: make them bigger
+        fig, axes = plt.subplots(len(rows), ncols, figsize=(width * ncols, height * len(rows)), squeeze=False, layout="constrained")
+        alpha = 1 - 2 ** (-1 / 10)  # EMA with a half-life of 10 steps
+        for row, names in zip(axes, rows):
+            for ax in row[len(names) :]:
+                fig.delaxes(ax)
+            for ax, name in zip(row, names):
+                steps, arr = metrics[name]["step"].numpy(), metrics[name]["value"].numpy()
+                if arr.ndim > 1:  # one line per entry, colored by its name
+                    default = [str(i + 1) for i in range(arr.shape[1])]
+                    labels = self.labels.get(name, self.labels.get(group_of(name), default))
+                    colors = {label: f"C{i % 10}" for i, label in enumerate(dict.fromkeys(labels))}
+                    ids = metrics[name + "_ids"]["value"].numpy() if name + "_ids" in metrics else None
+                    for j, label in enumerate(labels):
+                        first = labels.index(label) == j
+                        ax.plot(steps, arr[:, j], lw=1, color=colors[label], label=label if first else "_nolegend_")
+                        if ids is not None:
+                            for r in np.nonzero(np.r_[True, ids[1:, j] != ids[:-1, j]])[0]:
+                                ax.annotate(str(ids[r, j]), (steps[r], arr[r, j]), fontsize=6, color=colors[label],
+                                            xytext=(1, 1), textcoords="offset points")
+                elif "/" not in name:  # train metrics, logged every step: smooth them
+                    ema = arr.astype(np.float64)  # (copies; ints would truncate the average)
+                    for i in range(1, len(ema)):
+                        ema[i] = alpha * arr[i] + (1 - alpha) * ema[i - 1]
+                    ax.plot(steps, arr, alpha=0.4, label="raw")
+                    ax.plot(steps, ema, label="EMA")
+                else:
+                    ax.plot(steps, arr, "o-" if len(steps) < 50 else "-", ms=4)
+                if ax.get_legend_handles_labels()[0]:
+                    many = len(ax.get_legend_handles_labels()[0]) > 6
+                    ax.legend(fontsize=6 if many else 7, **(dict(loc="upper left", bbox_to_anchor=(1.01, 1)) if many else {}))
+                ylabel = self.ylabels.get(name, self.ylabels.get(group_of(name), ""))
+                ax.set(title=name.split("/", 1)[-1] if strip_group else name, xlabel="step", ylabel=ylabel)
+                ax.title.set_fontsize(9)
+        fig.suptitle(title, fontsize=10)
+        fig.savefig(out_path, dpi=150)
 
 
 def agreement_metrics(pred: np.ndarray, real: np.ndarray) -> dict[str, float]:
