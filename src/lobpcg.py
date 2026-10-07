@@ -65,7 +65,6 @@ def torch_lobpcg(
         reltol = 10 * n * (torch.linalg.norm(AX, ord=2, dim=0) + theta)
         res_converged = resid_norms < tol * reltol
         converged = torch.sum(res_converged)
-    # print(f"num_iters={i}")
     return theta, X
 
 

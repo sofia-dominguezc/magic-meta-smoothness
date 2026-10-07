@@ -1,3 +1,6 @@
 data/
 __pycache__/
 images/
+.pytest_cache/
+experiments/
+results/

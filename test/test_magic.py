@@ -2,8 +2,8 @@ import pytest
 import torch
 from torch.func import functional_call
 
-from src.data import majority
-from src.magic import LOSSES, Loader, SGDMomentumState, SGDState, batch_loss, magic, reversed_states, train
+from src.data import EvalLoader, Loader, Majority
+from src.magic import LOSSES, SGDMomentumState, SGDState, magic, reversed_states, train
 from src.models import MLP
 
 loss_fn = LOSSES["mse"]
@@ -11,7 +11,7 @@ loss_fn = LOSSES["mse"]
 
 def setup(optimizer: str):
     """Tiny majority task (float64 if the `float64` fixture is used) and an initial state."""
-    train_ds, test_ds = majority(True, "cpu", size=64, dim=8), majority(False, "cpu", size=64, dim=8)
+    train_ds, test_ds = Majority(True, size=64, dim=8), Majority(False, size=64, dim=8)
     torch.manual_seed(0)
     model = MLP(8, 1, width=16, depth=1).to(torch.get_default_dtype())
     params = {k: p.detach().clone() for k, p in model.named_parameters()}
@@ -38,17 +38,18 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
     """MAGIC's df/dw must equal autograd through the whole unrolled training."""
     model, loader, train_ds, test_ds, state = setup(optimizer)
     n_steps, eval_idxs = 11, [torch.arange(10), torch.arange(20, 50)]
-    _, outputs, betas = magic(model, loader, loss_fn, state, n_steps, test_ds, eval_idxs)
+    eval_loaders = [EvalLoader(test_ds, idx, batch_size=7) for idx in eval_idxs]  # several batches per eval set
+    outputs, betas = magic(model, loader, loss_fn, state, n_steps, eval_loaders)
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
     for t in range(n_steps):
-        batch, idx, _ = loader.get(t)
-        loss, _ = batch_loss(model, loss_fn, s.params, batch, w[idx])
+        X, Y, idx, _ = loader.get(t)
+        loss = (w[idx] * loss_fn(functional_call(model, s.params, (X,)), Y)).mean()
         s = s.step(torch.autograd.grad(loss, s.params, create_graph=True))
     for idx, output, beta in zip(eval_idxs, outputs, betas):
-        test = test_ds[idx]
-        f = loss_fn(functional_call(model, s.params, (test["x"],)), test).mean()
+        X, Y = test_ds.get_batch(idx)
+        f = loss_fn(functional_call(model, s.params, (X,)), Y).mean()
         (expected,) = torch.autograd.grad(f, w, retain_graph=True)
         torch.testing.assert_close(output, f.detach())
         torch.testing.assert_close(beta, expected)
@@ -57,7 +58,7 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
 def test_magic_does_not_modify_init_state():
     """On CPU `.to()` doesn't copy, so the replayed s_0 shares tensors with `init_state`."""
     model, loader, _, test_ds, state = setup("momentum")
-    magic(model, loader, loss_fn, state, 4, test_ds, [torch.arange(10)])
+    magic(model, loader, loss_fn, state, 4, [EvalLoader(test_ds, torch.arange(10))])
     assert not any(t.requires_grad for t in state.all_tensors)
 
 

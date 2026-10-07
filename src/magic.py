@@ -8,78 +8,43 @@ from torch import Tensor, nn
 from torch.func import functional_call
 from tqdm import tqdm
 
-from src.data import Dataset
+from src.data import EvalLoader, Loader
 from src.lobpcg import torch_lobpcg
-from src.utils import Logger
+from src.utils import Logger, dict_zip
 
-LossFn = Callable[[Tensor, dict[str, Tensor]], Tensor]  # (model output, batch) -> per-example losses [B]
-
-
-def mse(out: Tensor, batch: dict[str, Tensor]) -> Tensor:
-    assert out.shape == batch["y"].shape
-    return (out - batch["y"]).pow(2).flatten(1).mean(1)
+LossFn = Callable[[Tensor, Tensor], Tensor]  # (model output, Y) -> per-example losses [B]
 
 
-def cross_entropy(out: Tensor, batch: dict[str, Tensor]) -> Tensor:
-    return F.cross_entropy(out, batch["y"], reduction="none")
+def mse(out: Tensor, Y: Tensor) -> Tensor:
+    assert out.shape == Y.shape
+    return (out - Y).pow(2).flatten(1).mean(1)
+
+
+def cross_entropy(out: Tensor, Y: Tensor) -> Tensor:
+    return F.cross_entropy(out, Y, reduction="none")
 
 
 LOSSES: dict[str, LossFn] = {"mse": mse, "ce": cross_entropy}
 
 
-def batch_loss(
-    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor], batch: dict[str, Tensor], w: Tensor
-) -> tuple[Tensor, Tensor]:
-    """Weighted loss sum(w_i * loss_i) / B, and the model output."""
-    out = functional_call(model, params, (batch["x"],))
-    return (w * loss_fn(out, batch)).mean(), out
-
-
-def subset_loss(
-    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor], data: Dataset, idx: Tensor, chunk: int = 1024
-) -> tuple[Tensor, dict[str, Tensor]]:
-    """Mean loss over data[idx] and its gradient wrt `params`.
-    Computed in chunks of `chunk` examples to bound the memory."""
-    params = {k: p.detach().requires_grad_() for k, p in params.items()}
-    value, grads = torch.zeros((), device=data.device), {k: torch.zeros_like(p) for k, p in params.items()}
-    for i in range(0, len(idx), chunk):
-        batch = data[idx[i : i + chunk]]
-        term = loss_fn(functional_call(model, params, (batch["x"],)), batch).sum() / len(idx)
-        dgrads = torch.autograd.grad(term, params)
-        grads = {k: grads[k] + dgrads[k] for k in grads}
-        value += term.detach()
-    return value, grads
-
-
-@dataclass
-class Loader:
-    """Random batches (with replacement), deterministic in `step`, with per-example weights."""
-
-    dataset: Dataset
-    batch_size: int = 32
-    seed: int = 0
-    weights: Tensor | None = None  # [N]; None -> all ones
-
-    def __post_init__(self):
-        if self.weights is None:
-            self.weights = torch.ones(len(self.dataset))
-        self.weights = self.weights.to(self.dataset.device)
-
-    def get(self, step: int) -> tuple[dict[str, Tensor], Tensor, Tensor]:
-        """Returns (batch, indices, weights) for `step`."""
-        assert self.weights is not None
-        g = torch.Generator().manual_seed((self.seed << 32) + step)
-        idx = torch.randint(len(self.dataset), (self.batch_size,), generator=g).to(self.dataset.device, non_blocking=True)
-        return self.dataset[idx], idx, self.weights[idx]
-
-
-def dict_zip[T](*dicts: dict[str, T]) -> dict[str, tuple[T, ...]]:
-    """e.g. {"a": 1, "b": 2}, {"a": 3, "b": 4} -> {"a": (1, 3), "b": (2, 4)}"""
-    assert len(dicts) > 0
-    zipped_dict: dict[str, tuple[T, ...]] = {}
-    for key in dicts[0]:
-        zipped_dict[key] = tuple(d[key] for d in dicts)
-    return zipped_dict
+def eval_loss(
+    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor], loader: EvalLoader, grad: bool = False
+) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
+    """Mean loss and mean dataset metrics over the examples of `loader`, and (if `grad`,
+    else {}) the gradient of the loss wrt `params`, accumulated batch by batch to bound the memory."""
+    params = {k: p.detach().requires_grad_(grad) for k, p in params.items()}
+    loss, metrics = torch.zeros((), device=loader.device), {}
+    grads = {k: torch.zeros_like(p) for k, p in params.items()} if grad else {}
+    for X, Y in loader:
+        out = functional_call(model, params, (X,))
+        term = loss_fn(out, Y).sum() / len(loader)
+        if grad:
+            dgrads = torch.autograd.grad(term, params)
+            grads = {k: grads[k] + dgrads[k] for k in grads}
+        loss += term.detach()
+        for k, v in loader.dataset.metrics(out.detach(), Y).items():
+            metrics[k] = metrics.get(k, 0) + v.sum() / len(loader)
+    return loss, metrics, grads
 
 
 @dataclass(kw_only=True)
@@ -157,54 +122,79 @@ def train(
     model: nn.Module,
     loader: Loader,
     loss_fn: LossFn,
-    state: OptimState,
+    init_state: OptimState,
     *,
     start: int = 0,
     n_steps: int,
     ckpt_every: int | None = None,
     logger: Logger | None = None,
+    eval_loader: EvalLoader | None = None,
+    eval_every: int = 0,
     num_top_eigs: int = 0,
     progress: bool = True,
 ) -> tuple[OptimState, list[OptimState]]:
     """Train deterministically on steps [start, start + n_steps).
     Returns the final state and the states before steps start, start + ckpt_every, ...
+
+    If `eval_loader` is given, logs its loss and metrics every `eval_every` steps and at the end.
     """
-    state = state.apply(lambda t: t.to(loader.dataset.device, non_blocking=True))
+    if eval_loader is not None:
+        assert logger is not None and eval_every > 0
+    if num_top_eigs > 0:
+        assert logger is not None
+
+    def eval_log(step: int, state: OptimState):
+        if eval_loader is None or (step % eval_every != 0 and step != start + n_steps):
+            return
+        assert logger is not None
+        loss, metrics, _ = eval_loss(model, loss_fn, state.params, eval_loader)
+        logger.log(step, eval_loss=loss, **{f"eval_{k}": v for k, v in metrics.items()})
+
+    state = init_state.apply(lambda t: t.to(loader.device, non_blocking=True))
     ckpts: list[OptimState] = []
     eigvecs: Tensor | None = None
     for t in tqdm(range(start, start + n_steps), disable=not progress):
-        batch, _, w = loader.get(t)
+        X, Y, _, weights = loader.get(t)
         params = {k: p.detach().requires_grad_() for k, p in state.params.items()}
-        loss, out = batch_loss(model, loss_fn, params, batch, w)
+
+        logits: Tensor = functional_call(model, params, (X,))
+        loss = (weights * loss_fn(logits, Y)).mean()
         grads = torch.autograd.grad(loss, params, create_graph=num_top_eigs > 0)
 
-        if logger is not None:
-            metrics = loader.dataset.metrics(out.detach(), batch)
-            logger.log(t, loss=loss.detach(), **{k: v.mean() for k, v in metrics.items()})
-
         if ckpt_every and (t - start) % ckpt_every == 0:
-            ckpts.append(state.apply(lambda t: t.to("cpu")))
-
-        if num_top_eigs > 0:  # top Hessian eigenvalues via LOBPCG on the HVP operator
+            ckpts.append(state.apply(lambda t: t.to("cpu", copy=True)))
+        if logger is not None:
+            metrics = loader.dataset.metrics(logits.detach(), Y)
+            logger.log(
+                t, loss=loss.detach(), **{k: v.mean() for k, v in metrics.items()}
+            )
+        if num_top_eigs > 0:
+            assert logger is not None
             sizes = [p.numel() for p in params.values()]
 
             def hvp(V: Tensor) -> Tensor:  # [P, r] -> [P, r]
                 cols = []
                 for v in V.unbind(1):
                     vs = [c.view_as(p) for c, p in zip(v.split(sizes), params.values())]
-                    hv = torch.autograd.grad(list(grads.values()), params, grad_outputs=vs, retain_graph=True)
+                    hv = torch.autograd.grad(
+                        list(grads.values()), params, vs, retain_graph=True
+                    )
                     cols.append(torch.cat([h.flatten() for h in hv.values()]))
                 return torch.stack(cols, 1)
 
             if eigvecs is None:
                 g = torch.Generator().manual_seed(start)
-                eigvecs = torch.randn(sum(sizes), num_top_eigs, generator=g).to(loader.dataset.device, non_blocking=True)
+                eigvecs = torch.randn(
+                    sum(sizes), num_top_eigs, generator=g
+                ).to(loader.device, non_blocking=True)
             eigvals, eigvecs = torch_lobpcg(hvp, eigvecs)
-            if logger is not None:
-                logger.log(t, eigvals=eigvals)
+            logger.log(t, eigvals=eigvals)
             grads = {name: g.detach() for name, g in grads.items()}
 
+        eval_log(t, state)
         state = state.step(grads)
+
+    eval_log(start + n_steps, state)
     return state, ckpts
 
 
@@ -237,48 +227,54 @@ def magic(
     loss_fn: LossFn,
     init_state: OptimState,
     n_steps: int,
-    test_dataset: Dataset,
-    eval_idxs: list[Tensor],
-) -> tuple[OptimState, list[Tensor], list[Tensor]]:
-    """Run MAGIC for the eval functions "mean test loss over test_dataset[idx]".
+    eval_loaders: list[EvalLoader],
+) -> tuple[list[Tensor], list[Tensor]]:
+    """Run MAGIC for the eval functions "mean loss over the examples of each eval loader".
     Computational cost: `3 + #fns` trainings.
     Max memory usage: `sqrt(T) + #fns` model states.
 
-    Returns (s_T, list of f(s_T), list of df(s_T)/dw)
+    Returns (list of f(s_T), list of df(s_T)/dw)
     """
+    if len(eval_loaders) == 0:
+        return [], []
     all_states = reversed_states(  # 2x training
         model, loader, loss_fn, init_state, n_steps=n_steps
     )
-    final = next(all_states)
-    if len(eval_idxs) == 0:
-        return final, [], []
 
-    zero_state = final.apply(lambda t: torch.zeros_like(t))
+    final_state = next(all_states)
+    zero_state = final_state.apply(lambda t: torch.zeros_like(t))
     outputs: list[Tensor] = []       # f(s_t)
-    deltas: list[list[Tensor]] = []  # df/ds_t
+    deltas: list[list[Tensor]] = []  # df/ds_t (as a flattened OptimState)
     betas: list[Tensor] = []         # df/dw
-    for idx in eval_idxs:
-        f_value, f_grad = subset_loss(model, loss_fn, final.params, test_dataset, idx)
+    for eval_loader in eval_loaders:
+        f_value, _, f_grad = eval_loss(
+            model, loss_fn, final_state.params, eval_loader, grad=True
+        )
         outputs.append(f_value)
         deltas.append(replace(zero_state, params=f_grad).all_tensors)
-        betas.append(torch.zeros(len(loader.dataset), device=loader.dataset.device))
+        betas.append(torch.zeros(len(loader.dataset), device=loader.device))
 
     for t, state in zip(reversed(range(n_steps)), tqdm(all_states, total=n_steps)):
-        batch, indices, w = loader.get(t)
-        w = w.requires_grad_()
-        state = state.apply(lambda t: t.to(w.device, non_blocking=True).detach().requires_grad_())
-        loss, _ = batch_loss(model, loss_fn, state.params, batch, w)
-        grads = torch.autograd.grad(loss, state.params, create_graph=True)  # 1x training
+        X, Y, indices, weights = loader.get(t)
+        weights = weights.requires_grad_()
+        state = state.apply(
+            lambda t: t.to(loader.device, non_blocking=True).detach().requires_grad_()
+        )
+
+        logits: Tensor = functional_call(model, state.params, (X,))  # 1x forward
+        loss = (weights * loss_fn(logits, Y)).mean()
+        grads = torch.autograd.grad(loss, state.params, create_graph=True)  # 1x backward
         new_state = state.step(grads)
+
         for i, delta in enumerate(deltas):
             # (df/ds_t, df/dw_t) = ds_{t+1} / d(s_t, w_t) @ df/ds_{t+1}
-            *d_state, d_w = torch.autograd.grad(  # 1x training per `delta`
+            *d_state, d_weights = torch.autograd.grad(  # 1x double-backward per `delta`
                 new_state.all_tensors,
-                [*state.all_tensors, w],
+                [*state.all_tensors, weights],
                 delta,
                 retain_graph=i < len(deltas) - 1,
             )
             deltas[i] = d_state
-            betas[i].index_add_(0, indices, d_w)
+            betas[i].index_add_(0, indices, d_weights)
 
-    return final, outputs, betas
+    return outputs, betas
