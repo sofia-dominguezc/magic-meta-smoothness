@@ -1,41 +1,171 @@
-import torch.nn as nn
-from torch import Tensor
+"""Models in the maximal update parametrization (μP), in its "spectral" form (Yang, Simon & Bernstein 2023,
+"A spectral condition for feature learning"). A layer with weight W: fan_in -> fan_out and bias b stores raw
+tensors (w, b_raw) and computes
+    W = sqrt(fan_out / fan_in) * w,    b = sqrt(fan_out) * b_raw
+- init: w ~ N(0, 1/fan_out), so that W has the LeCun variance 1/fan_in (readout: N(0, 1/(fan_in fan_out)),
+  i.e. μP's 1/fan_in^2); b_raw = 0
+- this is the usual μP table up to the abc-symmetry (same training dynamics): the per-layer SGD learning rates
+  lr * fan_out / fan_in become forward multipliers, and one lr is used for all raw tensors
+- consequences: the optimizer state stays simple, the lr transfers across widths, the Hessian of the raw
+  parameters is the one whose top eigenvalue sets the stability of a step (2/lr for SGD), and every raw tensor
+  (parameter, gradient, update) has an O(1) operator norm in every layer (`utils.op_norm`)
+- Adam needs per-tensor lr multipliers instead: `adam_lr_mults`
+- normalization layers are parameter-free, so that the whole training state is the parameters
+Seed with torch.manual_seed before creating a model."""
 
-# Both models use the standard parametrization with LeCun init (W ~ N(0, 1/fan_in), b = 0),
-# which keeps (pre-)activations O(1) at every layer so that one global learning rate is
-# reasonable for all layers (at a fixed width). Seed with torch.manual_seed before creating.
+import math
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+
+def mu_init_(layer: nn.Linear | nn.Conv2d, readout: bool = False):
+    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(layer.weight)
+    nn.init.normal_(layer.weight, std=(fan_out * (fan_in if readout else 1)) ** -0.5)
+    nn.init.zeros_(layer.bias)
+
+
+class Linear(nn.Linear):
+    def __init__(self, in_dim: int, out_dim: int, readout: bool = False):
+        super().__init__(in_dim, out_dim)
+        self.mult = (out_dim / in_dim) ** 0.5
+        mu_init_(self, readout)
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.linear(input, self.mult * self.weight, self.out_features**0.5 * self.bias)
+
+
+class Conv2d(nn.Conv2d):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, stride: int = 1, padding: int = 0):
+        super().__init__(in_ch, out_ch, kernel_size, stride=stride, padding=padding)
+        self.mult = (out_ch / in_ch) ** 0.5
+        mu_init_(self)
+
+    def forward(self, input: Tensor) -> Tensor:
+        return self._conv_forward(input, self.mult * self.weight, self.out_channels**0.5 * self.bias)
+
+
+def norm(x: Tensor, dims: int | tuple[int, ...], eps: float = 1e-5) -> Tensor:
+    """Parameter-free layer norm over `dims`."""
+    x = x - x.mean(dims, keepdim=True)
+    return x * torch.rsqrt(x.pow(2).mean(dims, keepdim=True) + eps)
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, width: int = 32, depth: int = 1):
+    sizes = {"small": dict(width=64), "default": dict(width=512)}
+
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int, depth: int = 2):
         super().__init__()
-        dims = [in_dim] + [width] * depth
-        self.hidden = nn.ModuleList(nn.Linear(a, b) for a, b in zip(dims, dims[1:]))
-        self.out = nn.Linear(dims[-1], out_dim)
-        for layer in [*self.hidden, self.out]:
-            nn.init.normal_(layer.weight, std=layer.in_features**-0.5)
-            nn.init.zeros_(layer.bias)
+        dims = [math.prod(in_shape)] + [width] * depth
+        self.hidden = nn.ModuleList(Linear(a, b) for a, b in zip(dims, dims[1:]))
+        self.out = Linear(width, out_dim, readout=True)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten(1)
         for layer in self.hidden:
-            x = nn.functional.gelu(layer(x))
+            x = F.gelu(layer(x))
         return self.out(x)
 
 
-class CNN(nn.Module):
-    """`depth` blocks of conv3x3 -> GELU -> maxpool (doubling the channels), then a linear head."""
+class Block(nn.Module):
+    """Pre-activation residual block: x + conv(gelu(norm(conv(gelu(norm(x)))))), with a 1x1 shortcut if the shape changes."""
 
-    def __init__(self, in_channels: int, out_dim: int, width: int = 16, depth: int = 2):
+    def __init__(self, in_ch: int, out_ch: int, stride: int):
         super().__init__()
-        channels = [in_channels] + [width * 2**i for i in range(depth)]
-        self.convs = nn.ModuleList(nn.Conv2d(a, b, 3, padding=1) for a, b in zip(channels, channels[1:]))
-        self.out = nn.Linear(channels[-1] * 4 * 4, out_dim)
-        for layer in [*self.convs, self.out]:
-            nn.init.normal_(layer.weight, std=layer.weight[0].numel() ** -0.5)
-            nn.init.zeros_(layer.bias)
+        self.conv1 = Conv2d(in_ch, out_ch, 3, stride=stride, padding=1)
+        self.conv2 = Conv2d(out_ch, out_ch, 3, padding=1)
+        self.shortcut = Conv2d(in_ch, out_ch, 1, stride=stride) if stride != 1 or in_ch != out_ch else None
 
     def forward(self, x: Tensor) -> Tensor:
-        for conv in self.convs:
-            x = nn.functional.max_pool2d(nn.functional.gelu(conv(x)), 2)
-        return self.out(nn.functional.adaptive_avg_pool2d(x, 4).flatten(1))
+        h = F.gelu(norm(x, (1, 2, 3)))
+        skip = x if self.shortcut is None else self.shortcut(h)
+        return skip + self.conv2(F.gelu(norm(self.conv1(h), (1, 2, 3))))
+
+
+class ResNet(nn.Module):
+    """Pre-activation ResNet for small images: a 3x3 stem, 3 stages of `blocks` residual blocks with
+    width, 2 * width, 4 * width channels (strides 1, 2, 2), global average pooling and a linear readout."""
+
+    sizes = {"small": dict(width=16), "default": dict(width=64)}
+
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int, blocks: int = 1):
+        super().__init__()
+        self.stem = Conv2d(in_shape[0], width, 3, padding=1)
+        self.blocks = nn.ModuleList()
+        in_ch = width
+        for stage, out_ch in enumerate([width, 2 * width, 4 * width]):
+            for block in range(blocks):
+                self.blocks.append(Block(in_ch, out_ch, stride=2 if stage > 0 and block == 0 else 1))
+                in_ch = out_ch
+        self.out = Linear(in_ch, out_dim, readout=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.stem(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.out(F.gelu(norm(x, (1, 2, 3))).mean((2, 3)))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        self.heads = heads
+        self.qkv = Linear(dim, 3 * dim)
+        self.proj = Linear(dim, dim)
+        self.fc1 = Linear(dim, 4 * dim)
+        self.fc2 = Linear(4 * dim, dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, N, D = x.shape
+        q, k, v = self.qkv(norm(x, -1)).view(B, N, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)  # [B, h, N, d]
+        attn = (q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5).softmax(-1)
+        x = x + self.proj((attn @ v).transpose(1, 2).flatten(2))
+        return x + self.fc2(F.gelu(self.fc1(norm(x, -1))))
+
+
+class ViT(nn.Module):
+    """Pre-norm ViT with `patch` x `patch` patches, learned positional embeddings (a bias-like raw tensor:
+    N(0, 1/dim), used as sqrt(dim) * pos), heads of `head_dim` dims, mean pooling and a linear readout."""
+
+    sizes = {"small": dict(dim=64), "default": dict(dim=192)}
+
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, dim: int, depth: int = 4, head_dim: int = 32, patch: int = 4):
+        super().__init__()
+        C, H, W = in_shape
+        self.patch = patch
+        self.embed = Linear(C * patch * patch, dim)
+        self.pos = nn.Parameter(torch.randn((H // patch) * (W // patch), dim) / dim**0.5)
+        self.blocks = nn.ModuleList(TransformerBlock(dim, dim // head_dim) for _ in range(depth))
+        self.out = Linear(dim, out_dim, readout=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        p = self.patch
+        x = x.view(B, C, H // p, p, W // p, p).permute(0, 2, 4, 1, 3, 5).reshape(B, -1, C * p * p)
+        x = self.embed(x) + self.pos.shape[1] ** 0.5 * self.pos
+        for block in self.blocks:
+            x = block(x)
+        return self.out(norm(x, -1).mean(1))
+
+
+MODELS: dict[str, type[nn.Module]] = {"mlp": MLP, "cnn": ResNet, "vit": ViT}
+
+
+def adam_lr_mults(model: nn.Module) -> dict[str, float]:
+    """μP learning rate multipliers for Adam on the raw tensors (for SGD they are all 1 in this parametrization):
+    1/sqrt(fan_in * fan_out) for weights, 1/sqrt(fan_out) for biases and positional embeddings, so that an Adam
+    step (entries of size ~lr) moves each raw tensor by O(lr) in operator norm, like an SGD step."""
+    mults = {}
+    for name, p in model.named_parameters():
+        if p.ndim == 1 or name.endswith("pos"):
+            mults[name] = p.shape[-1] ** -0.5
+        else:
+            fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(p)
+            mults[name] = (fan_in * fan_out) ** -0.5
+    return mults
+
+
+def build_model(name: str, size: str, in_shape: tuple[int, ...], out_dim: int) -> nn.Module:
+    model_cls = MODELS[name]
+    return model_cls(in_shape, out_dim, **model_cls.sizes[size])

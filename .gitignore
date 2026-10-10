@@ -4,3 +4,5 @@ images/
 .pytest_cache/
 experiments/
 results/
+wandb/
+NOTES.txt

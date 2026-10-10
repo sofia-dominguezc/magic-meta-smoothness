@@ -132,3 +132,35 @@ def _extend_basis(X, m):
     h = -2 * torch.linalg.multi_dot([w, w[k:, :].T, other])
     h[k:] += other
     return h
+
+
+def top_hessian_eigs(
+    grads: dict[str, torch.Tensor], params: dict[str, torch.Tensor], k: int,
+    eigvecs: torch.Tensor | None = None, precond: dict[str, torch.Tensor] | None = None, seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Top k eigenvalues of the Hessian H (w.r.t. `params`) of the loss whose gradient is `grads`
+    (computed with create_graph=True), by LOBPCG.
+    Args:
+    - eigvecs: [#params, k] to warm-start LOBPCG (None: random with `seed`)
+    - precond: per-element multiplier P of the gradient in the optimizer step (None: 1): then the eigenvalues
+      are those of sqrt(P) H sqrt(P), which govern the stability of the step
+    Returns: (eigenvalues [k], eigenvectors [#params, k] to warm-start the next call, LOBPCG iterations).
+    """
+    sizes = [p.numel() for p in params.values()]
+    sqrt_p = None if precond is None else torch.cat([p.flatten() for p in precond.values()]).sqrt()[:, None]
+
+    def hvp(V: torch.Tensor) -> torch.Tensor:  # [#params, k] -> [#params, k]
+        if sqrt_p is not None:
+            V = sqrt_p * V
+        cols = []
+        for v in V.unbind(1):
+            vs = [c.view_as(p) for c, p in zip(v.split(sizes), params.values())]
+            hv = torch.autograd.grad(list(grads.values()), params, vs, retain_graph=True)
+            cols.append(torch.cat([h.flatten() for h in hv.values()]))
+        HV = torch.stack(cols, 1)
+        return HV if sqrt_p is None else sqrt_p * HV
+
+    if eigvecs is None:
+        g = torch.Generator().manual_seed(seed)
+        eigvecs = torch.randn(sum(sizes), k, generator=g).to(next(iter(params.values())))
+    return torch_lobpcg(hvp, eigvecs)

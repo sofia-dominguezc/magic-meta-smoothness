@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import Iterator
 
 import torch
@@ -6,92 +7,73 @@ from torch import Tensor
 
 
 class Dataset:
-    out_dim: int
+    """Classification dataset with int labels."""
+
+    in_shape: tuple[int, ...]
+    out_dim: int  # number of classes
+    labels: Tensor  # [N] int64, on CPU
 
     def __len__(self) -> int:
-        raise NotImplementedError
-
-    def __getitem__(self, i: int) -> tuple[Tensor, Tensor]:
-        raise NotImplementedError
-
-    def label(self, i: int) -> int:
-        """Class of example i, used to choose subsets by label."""
-        raise NotImplementedError
-
-    def metrics(self, out: Tensor, Y: Tensor) -> dict[str, Tensor]:
-        """Per-example metrics of the model output, for logging."""
-        return {}
+        return len(self.labels)
 
     def get_batch(self, idx: Tensor) -> tuple[Tensor, Tensor]:
         """The batch (X, Y) of the examples `idx` (a CPU tensor)."""
-        X, Y = zip(*(self[i] for i in idx.tolist()))
-        return torch.stack(X), torch.stack(Y)
+        raise NotImplementedError
 
 
-class MNIST(Dataset):
-    out_dim = 10
+class Images(Dataset):
+    """MNIST or CIFAR10 from torchvision, kept as uint8 [N, C, H, W] and normalized per batch."""
 
-    def __init__(self, train: bool, root: str = "./data"):
-        from torchvision.datasets import MNIST
-        from torchvision.transforms import Compose, ToTensor, Normalize
+    stats = {"MNIST": ((0.1307,), (0.3081,)), "CIFAR10": ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))}
 
-        transform = Compose([ToTensor(), Normalize((0.1307,), (0.3081,))])
-        self.data = MNIST(root, train=train, download=True, transform=transform)
+    def __init__(self, name: str, train: bool, root: str = "./data"):
+        import torchvision.datasets
 
-    def __len__(self) -> int:
-        return len(self.data)
+        data = getattr(torchvision.datasets, name)(root, train=train, download=True)
+        X = torch.as_tensor(data.data)  # MNIST: [N, 28, 28]; CIFAR10: [N, 32, 32, 3]
+        self.X = (X[:, None] if X.ndim == 3 else X.permute(0, 3, 1, 2)).contiguous()
+        self.labels = torch.as_tensor(data.targets, dtype=torch.long)
+        mean, std = self.stats[name]
+        self.mean, self.std = torch.tensor(mean)[:, None, None], torch.tensor(std)[:, None, None]
+        self.in_shape, self.out_dim = tuple(self.X.shape[1:]), 10
 
-    def label(self, i: int) -> int:
-        return int(self.data.targets[i])
-
-    def metrics(self, out: Tensor, Y: Tensor) -> dict[str, Tensor]:
-        correct = out.gather(1, Y[:, None])[:, 0]
-        best_other = out.scatter(1, Y[:, None], float("-inf")).max(1).values
-        return {"acc": (out.argmax(1) == Y).float(), "margin": correct - best_other}
-
-    def __getitem__(self, i: int) -> tuple[Tensor, Tensor]:
-        x, y = self.data[i]  # [1, 28, 28], int
-        return x, torch.tensor(y)
+    def get_batch(self, idx: Tensor) -> tuple[Tensor, Tensor]:
+        X = (self.X[idx].to(torch.get_default_dtype()) / 255 - self.mean) / self.std
+        return X, self.labels[idx]
 
 
 class Majority(Dataset):
-    """Toy task: y = sign(sum(x)) with ~2% label noise (use with the MSE loss).
-    Example i is generated from its own seed, so nothing is stored."""
-
-    out_dim = 1
+    """Toy task: x ~ N(0, I), y = [sum(x) > 0] with ~2% label noise.
+    Example i is generated from its own seed, so only the labels are stored."""
 
     def __init__(self, train: bool, size: int = 512, dim: int = 32, seed: int = 0):
-        self.size, self.dim, self.seed = size, dim, 2 * seed + (0 if train else 1)
+        self.dim, self.seed = dim, 2 * seed + (0 if train else 1)
+        self.in_shape, self.out_dim = (dim,), 2
+        self.labels = torch.stack([self.example(i)[1] for i in range(size)])
 
-    def __len__(self) -> int:
-        return self.size
-
-    def label(self, i: int) -> int:
-        return int(self[i][1].item() > 0)
-
-    def __getitem__(self, i: int) -> tuple[Tensor, Tensor]:
+    def example(self, i: int) -> tuple[Tensor, Tensor]:
         g = torch.Generator().manual_seed((self.seed << 32) + i)
         x = torch.randn(self.dim, generator=g)
-        y = torch.where(x.sum() > 0, 1.0, -1.0).to(x.dtype)
-        if torch.randn((), generator=g) > 2:
-            y = -y
-        return x, y[None]
+        flip = torch.randn((), generator=g) > 2
+        return x, torch.tensor(int((x.sum() > 0) != flip))
 
-    def metrics(self, out: Tensor, Y: Tensor) -> dict[str, Tensor]:
-        return {"acc": ((out > 0) == (Y > 0)).float().mean(1), "margin": (out * Y).mean(1)}
+    def get_batch(self, idx: Tensor) -> tuple[Tensor, Tensor]:
+        X, Y = zip(*(self.example(i) for i in idx.tolist()))
+        return torch.stack(X), torch.stack(Y)
 
 
-DATASETS = {"mnist": MNIST, "majority": Majority}
+DATASETS = {"mnist": partial(Images, "MNIST"), "cifar10": partial(Images, "CIFAR10"), "majority": Majority}
 
 
 @dataclass
 class Loader:
-    """Random batches deterministic in `step`, with per-example weights"""
+    """Random batches deterministic in `step`, with per-example weights from step `weights_from` on (all ones before)."""
 
     dataset: Dataset
     batch_size: int = 32
     device: torch.device | str | None = None
     weights: Tensor | None = None  # [N] on CPU; None -> all ones
+    weights_from: int = 0
     seed: int = 0
 
     def __post_init__(self):
@@ -107,7 +89,8 @@ class Loader:
         g = torch.Generator().manual_seed((self.seed << 32) + step)
         idx = torch.randint(len(self.dataset), (self.batch_size,), generator=g)
         X, Y = self.dataset.get_batch(idx)
-        X, Y, idx, w = map(self._to_device, (X, Y, idx, self.weights[idx]))
+        w = self.weights[idx] if step >= self.weights_from else torch.ones(len(idx))
+        X, Y, idx, w = map(self._to_device, (X, Y, idx, w))
         return X, Y, idx, w
 
 
@@ -117,7 +100,7 @@ class EvalLoader:
 
     dataset: Dataset
     indices: Tensor | None = None  # CPU; None -> all
-    batch_size: int = 32
+    batch_size: int = 256
     device: torch.device | str | None = None
 
     def __post_init__(self):
@@ -138,8 +121,8 @@ class EvalLoader:
 
 @dataclass(frozen=True, kw_only=True)
 class Subset:
-    """A deterministic random subset: `frac` of the examples of class `label` (or of
-    all examples if None), chosen with `seed`. Training runs drop it (weight 0), and
+    """A deterministic random subset of `frac` * (dataset size) examples, all of class `label`
+    (or of any class if None), chosen with `seed`. Training runs drop it (weight 0), and
     evaluation functions are the mean loss over it.
     """
 
@@ -149,11 +132,43 @@ class Subset:
 
     def mask(self, data: Dataset) -> Tensor:
         """Boolean mask [N] (on CPU), True on the selected examples."""
-        if self.label is None:
-            idx = torch.arange(len(data))
-        else:  # one pass over the labels, which aren't stored
-            idx = torch.tensor([i for i in range(len(data)) if data.label(i) == self.label], dtype=torch.long)
+        idx = torch.arange(len(data)) if self.label is None else (data.labels == self.label).nonzero()[:, 0]
+        n = round(self.frac * len(data))
+        if n > len(idx):
+            raise ValueError(f"{self.frac:.0%} of the {len(data)} examples is {n}, but label {self.label} has only {len(idx)}")
         perm = torch.randperm(len(idx), generator=torch.Generator().manual_seed(self.seed))
         mask = torch.zeros(len(data), dtype=torch.bool)
-        mask[idx[perm[: round(self.frac * len(idx))]]] = True
+        mask[idx[perm[:n]]] = True
         return mask
+
+
+@dataclass(frozen=True, kw_only=True)
+class Perturbation:
+    """A deterministic change of the per-example training weights w (1 = unchanged), chosen with `seed`:
+    - kind "drop": w = 0 on a random `alpha` fraction of the examples (of class `label` if given, see `Subset`)
+    - kind "randn": w = 1 + alpha * N(0, 1) on every example (continuous in alpha; RMS of w - 1 = alpha)
+    """
+
+    kind: str = "drop"
+    alpha: float
+    label: int | None = None
+    seed: int = 0
+
+    def weights(self, data: Dataset) -> Tensor:
+        """The weights [N] (on CPU)."""
+        if self.kind == "drop":
+            return (~Subset(frac=self.alpha, label=self.label, seed=self.seed).mask(data)).to(torch.get_default_dtype())
+        assert self.kind == "randn" and self.label is None, self
+        return 1 + self.alpha * torch.randn(len(data), generator=torch.Generator().manual_seed(self.seed))
+
+    @property
+    def group(self) -> str:
+        """What the perturbation does, without the seed (e.g. to color points)."""
+        if self.kind == "randn":
+            return f"randn {self.alpha:g}"
+        return f"drop {self.alpha:.1%} of " + ("all labels" if self.label is None else f"label {self.label}")
+
+    @property
+    def name(self) -> str:
+        return self.group.replace(" of ", "_").replace(" ", "_").replace("%", "pct") + f"_seed_{self.seed}"
+
