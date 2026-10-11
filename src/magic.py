@@ -205,7 +205,7 @@ class Magic:
     through the whole training.
 
     Logging settings (for `forward_pass(log=True)`; the backward pass logs whenever `logger` is given):
-    - test_loader, eval_every: log the test loss and metrics every `eval_every` steps
+    - test_loader, eval_every: log the loss and metrics on `test_loader` every `eval_every` steps
     - num_top_eigs: log this many top (preconditioned) Hessian eigenvalues (0: none)
     - log_tangent: log the norms of the forward tangent ds_t/ds_0 v, for a random v with unit-norm tensors
     """
@@ -224,11 +224,12 @@ class Magic:
     ):
         self.model, self.loader, self.loss_fn, self.logger = model, loader, loss_fn, logger
         self.test_loader, self.eval_every = test_loader, eval_every
-        self.num_top_eigs, self.log_tangent = num_top_eigs, log_tangent
+        self.n_eigs, self.log_tangent = num_top_eigs, log_tangent
         self.device, self.dataset = loader.device, loader.dataset
 
     def forward_pass(
-        self, init_state: OptimState, *, n_steps: int, start: int = 0, ckpt_every: int | None = None, log: bool = False
+        self, init_state: OptimState, *, n_steps: int, start: int = 0,
+        ckpt_every: int | None = None, log: bool = False,
     ) -> tuple[OptimState, list[OptimState]]:
         """Train on steps [start, start + n_steps).
         Returns: (final state, states before steps start, start + ckpt_every, ...), on the CPU.
@@ -249,7 +250,9 @@ class Magic:
         if logger is not None and self.log_tangent:
             g = torch.Generator().manual_seed(start)
             tangent = state.apply(lambda t: torch.randn(t.shape, generator=g, dtype=t.dtype))
-            tangent = tangent.apply(lambda t: (t / op_norm(t, n_iter=100)[0]).to(self.device, non_blocking=True))
+            tangent = tangent.apply(
+                lambda t: (t / op_norm(t, n_iter=10)[0]).to(self.device, non_blocking=True)
+            )
 
         for t in tqdm(range(start, start + n_steps), disable=logger is None):
             if ckpt_every and (t - start) % ckpt_every == 0:
@@ -263,7 +266,7 @@ class Magic:
 
             out: Tensor = functional_call(self.model, params, (X,))
             loss = (weights * self.loss_fn(out, Y)).mean()
-            grads = torch.autograd.grad(loss, params, create_graph=logger is not None and self.num_top_eigs > 0)
+            grads = torch.autograd.grad(loss, params, create_graph=logger is not None and self.n_eigs > 0)
             state = state.step(grads)
 
             if tangent is not None:
@@ -272,44 +275,52 @@ class Magic:
             state = state.apply(lambda t: t.detach())
 
             if logger is not None:
-                logger.log(t, loss=loss, **{k: v.mean() for k, v in metrics(out.detach(), Y).items()})
+                train_metrics = metrics(out.detach(), Y)
+                logger.log(t, loss=loss, **{k: v.mean() for k, v in train_metrics.items()})
                 logger.log_norms(t, "params", params)
                 logger.log_norms(t, "grads", grads)
                 if tangent is not None:
                     logger.log_norms(t, "tangent", tangent)
-                if self.num_top_eigs > 0:
+                if self.n_eigs > 0:
                     eigvals, eigvecs, n_iter = top_hessian_eigs(
-                        grads, params, self.num_top_eigs, eigvecs, precond=state.precond, seed=start
+                        grads, params, self.n_eigs, eigvecs, precond=state.precond, seed=start
                     )
                     eigvals = eigvals * (2 / state.stability_threshold)
-                    logger.log(t, **{f"eig/{i + 1}": v for i, v in enumerate(eigvals.unbind())}, lobpcg_iters=torch.tensor(n_iter))
+                    logger.log(
+                        t, **{f"eig/{i + 1}": v for i, v in enumerate(eigvals.unbind())},
+                        lobpcg_iters=torch.tensor(n_iter),
+                    )
                 if self.test_loader is not None and ((t - start + 1) % self.eval_every == 0 or t - start == n_steps - 1):
-                    assert (indices := self.test_loader.indices) is not None
-                    perm = torch.randperm(len(indices), generator=torch.Generator().manual_seed(t))
-                    test_loader = replace(self.test_loader, indices=indices[perm[: len(indices) // 10]])
-                    test_loss, test_metrics, _ = eval_loss(self.model, self.loss_fn, state.params, test_loader)
-                    logger.log(t, **{f"test {k}": v for k, v in {"loss": test_loss, **test_metrics}.items()})
+                    val_loss, val_metrics, _ = eval_loss(self.model, self.loss_fn, state.params, self.test_loader)
+                    logger.log(t, **{"test loss": val_loss} | {f"test {k}": v for k, v in val_metrics.items()})
 
         return state.apply(lambda t: t.cpu()), ckpts
 
-    def rewind(self, init_state: OptimState, *, n_steps: int, start: int = 0, passes: int = 2) -> Iterator[OptimState]:
-        """The states [start, start + n_steps] in reverse order, reconstructed by re-training.
-        Cost: `passes` trainings; memory: passes * n_steps^(1/passes) states.
+    def rewind(
+        self, init_state: OptimState, *, n_steps: int, start: int = 0, passes: int = 2
+    ) -> Iterator[OptimState]:
+        """Reconstruct the states [start, start + n_steps] in reverse order.
+        Cost: `passes` trainings. Memory: `passes * n_steps^(1/passes)` states.
         """
         chunk = math.ceil(n_steps ** ((passes - 1) / passes))  # 1 if passes == 1
-        final, ckpts = self.forward_pass(init_state, n_steps=n_steps, start=start, ckpt_every=chunk)
+        final, ckpts = self.forward_pass(
+            init_state, n_steps=n_steps, start=start, ckpt_every=chunk
+        )
         yield final
+        if passes == 1:
+            yield from reversed(ckpts)
+            return
         for i, ckpt in reversed(list(enumerate(ckpts))):
-            if passes == 1:
-                yield ckpt
-                continue
             t0 = start + i * chunk
-            inner = self.rewind(ckpt, n_steps=min(chunk, start + n_steps - t0), start=t0, passes=passes - 1)
+            inner = self.rewind(
+                ckpt, n_steps=min(chunk, start + n_steps - t0), start=t0, passes=passes - 1
+            )
             next(inner)  # its final state, already yielded
             yield from inner
 
     def backward_pass(
-        self, init_state: OptimState, *, n_steps: int, start: int = 0, eval_loaders: dict[str, EvalLoader], passes: int = 2
+        self, init_state: OptimState, *, n_steps: int, start: int = 0,
+        eval_loaders: dict[str, EvalLoader], passes: int = 2,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         """MAGIC over the steps [start, start + n_steps) from `init_state`, for the eval functions
         f = "mean loss over the examples of each eval loader" (named by the dict keys).
@@ -327,7 +338,9 @@ class Magic:
         deltas: dict[str, OptimState] = {}  # df/ds_t
         betas: dict[str, Tensor] = {}       # df/dw
         for name, eval_loader in eval_loaders.items():
-            f_value, _, f_grad = eval_loss(self.model, self.loss_fn, final_state.params, eval_loader, grad=True)
+            f_value, _, f_grad = eval_loss(
+                self.model, self.loss_fn, final_state.params, eval_loader, grad=True
+            )
             outputs[name] = f_value
             deltas[name] = replace(zero_state, params=f_grad)
             betas[name] = torch.zeros(len(self.dataset), device=self.device)

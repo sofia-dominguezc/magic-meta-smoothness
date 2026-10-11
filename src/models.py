@@ -53,9 +53,7 @@ def norm(x: Tensor, dims: int | tuple[int, ...], eps: float = 1e-5) -> Tensor:
 
 
 class MLP(nn.Module):
-    sizes = {"small": dict(width=64), "default": dict(width=512)}
-
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int, depth: int = 2):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 512, depth: int = 2):
         super().__init__()
         dims = [math.prod(in_shape)] + [width] * depth
         self.hidden = nn.ModuleList(Linear(a, b) for a, b in zip(dims, dims[1:]))
@@ -87,9 +85,7 @@ class ResNet(nn.Module):
     """Pre-activation ResNet for small images: a 3x3 stem, 3 stages of `blocks` residual blocks with
     width, 2 * width, 4 * width channels (strides 1, 2, 2), global average pooling and a linear readout."""
 
-    sizes = {"small": dict(width=16), "default": dict(width=64)}
-
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int, blocks: int = 1):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 64, blocks: int = 1):
         super().__init__()
         self.stem = Conv2d(in_shape[0], width, 3, padding=1)
         self.blocks = nn.ModuleList()
@@ -128,9 +124,7 @@ class ViT(nn.Module):
     """Pre-norm ViT with `patch` x `patch` patches, learned positional embeddings (a bias-like raw tensor:
     N(0, 1/dim), used as sqrt(dim) * pos), heads of `head_dim` dims, mean pooling and a linear readout."""
 
-    sizes = {"small": dict(dim=64), "default": dict(dim=192)}
-
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, dim: int, depth: int = 4, head_dim: int = 32, patch: int = 4):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, dim: int = 192, depth: int = 4, head_dim: int = 32, patch: int = 4):
         super().__init__()
         C, H, W = in_shape
         self.patch = patch
@@ -165,7 +159,3 @@ def adam_lr_mults(model: nn.Module) -> dict[str, float]:
             mults[name] = (fan_in * fan_out) ** -0.5
     return mults
 
-
-def build_model(name: str, size: str, in_shape: tuple[int, ...], out_dim: int) -> nn.Module:
-    model_cls = MODELS[name]
-    return model_cls(in_shape, out_dim, **model_cls.sizes[size])

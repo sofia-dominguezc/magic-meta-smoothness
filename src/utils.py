@@ -1,6 +1,5 @@
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -39,35 +38,17 @@ def op_norm(t: Tensor, u: Tensor | None = None, n_iter: int = 3) -> tuple[Tensor
 
 
 class Logger:
-    """Accumulates per-step scalars on the device and only moves them to the CPU (and optionally to wandb)
-    every `flush_every` values, so training never syncs.
+    """Accumulates per-step scalars on the device and only moves them to the CPU every `flush_every` values,
+    so training never syncs.
     - metric names are "panel" or "panel/line": `finish` plots one panel per panel name, one line per line name
-    - `log_norms` logs the `op_norm`, with `init_power_iters` power iterations the first time a tensor is seen
-      and `power_iters` (warm-started) afterwards
+    - `log_norms` logs the `op_norm`, with 10 power iterations the first time a tensor is seen and 3 (warm-started)
+      afterwards
     - the "eig" panel is for the normalized top Hessian eigenvalues: the edge of stability is drawn at 2
     """
 
-    def __init__(
-        self,
-        wandb_project: str | None = None,
-        name: str = "logging run",
-        config: dict | None = None,
-        *,
-        flush_every: int = 100,
-        init_power_iters: int = 10,
-        power_iters: int = 3,
-    ):
+    def __init__(self, name: str = "logging run", *, flush_every: int = 100):
         self.name = name
         self.flush_every = flush_every
-        self.init_power_iters = init_power_iters
-        self.power_iters = power_iters
-        self.wandb_run = None
-        if wandb_project is not None:
-            import wandb
-
-            self.wandb_run = wandb.init(project=wandb_project, name=name, config=config)
-            self.wandb_run.define_metric("step")
-            self.wandb_run.define_metric("*", step_metric="step")  # steps need not increase (backward pass)
         self._buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)
         self._history: dict[str, list[tuple[list[int], Tensor]]] = defaultdict(list)  # (steps, values) per flush
         self._u: dict[str, Tensor | None] = {}  # power iteration vectors, by metric name
@@ -90,8 +71,8 @@ class Logger:
             for k, t in group_tensors.items():
                 key = f"{panel}/{k}"
                 if (u := self._u.get(key)) is None:
-                    u = op_norm(t, None, self.init_power_iters)[1]
-                norm, self._u[key] = op_norm(t, u, self.power_iters)
+                    u = op_norm(t, None, n_iter=10)[1]
+                norm, self._u[key] = op_norm(t, u, n_iter=3)
                 self._buf[key].append((step, norm))
         self._maybe_flush()
 
@@ -100,16 +81,9 @@ class Logger:
             self.flush()
 
     def flush(self):
-        per_step: dict[int, dict[str, Any]] = defaultdict(dict)
         for k, entries in self._buf.items():
-            vals = torch.stack([v for _, v in entries]).cpu()
-            self._history[k].append(([s for s, _ in entries], vals))
-            for (s, _), v in zip(entries, vals):
-                per_step[s][k] = v.item()
+            self._history[k].append(([s for s, _ in entries], torch.stack([v for _, v in entries]).cpu()))
         self._buf.clear()
-        if self.wandb_run is not None:
-            for s in sorted(per_step):
-                self.wandb_run.log({**per_step[s], "step": s})
 
     def finish(self, path: Path):
         """Save the logged metrics to `path` as {name: {"step": [n], "value": [n]}} and plot them next to it:
@@ -131,8 +105,6 @@ class Logger:
             self._plot_scalars(metrics, scalars, path.with_suffix(".png"))
         if norms:
             self._plot_norms(metrics, norms, path.with_name(f"{path.stem}_norms.png"))
-        if self.wandb_run is not None:
-            self.wandb_run.finish()
 
     def _grid(self, n_panels: int, ncols: int, size: tuple[float, float]):
         ncols = min(ncols, n_panels)
@@ -184,110 +156,3 @@ class Logger:
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="outside right center", fontsize=6, frameon=False)
         fig.savefig(out_path, dpi=150)
-
-
-def agreement_metrics(pred: np.ndarray, real: np.ndarray) -> dict[str, float]:
-    """How well `pred` matches `real` under the assumption real = pred (slope 1, no offset).
-    All are symmetric in (pred, real) and independent of their number.
-    - ccc:       Lin's concordance correlation, 2 cov / (var_p + var_r + (mean_p - mean_r)^2) = 1 - E(p - r)^2 / (...):
-                 the R^2 of the identity line; in [-1, 1], 1 iff pred = real; penalizes slope and offset errors
-    - spearman:  rank correlation; in [-1, 1]; ignores scale and offset, robust to a few large errors
-    - cosine:    cosine similarity of the raw vectors (slope 1 through the origin, no centering)
-    - tls_slope: total-least-squares slope through the origin (1 is perfect; symmetric: slope(r, p) = 1/slope(p, r))
-    - rel_rmse:  ||pred - real|| / sqrt(||pred|| ||real||)
-    """
-    p, r = pred.astype(np.float64), real.astype(np.float64)
-    eps = 1e-12
-    cov = np.mean((p - p.mean()) * (r - r.mean()))
-    d = p @ p - r @ r
-    tls_slope = (d + np.sqrt(d**2 + 4 * (r @ p) ** 2)) / (2 * (r @ p) + eps)
-    ranks = [np.argsort(np.argsort(x)).astype(np.float64) for x in (p, r)]
-    return {
-        "ccc": float(2 * cov / (p.var() + r.var() + (p.mean() - r.mean()) ** 2 + eps)),
-        "spearman": float(np.corrcoef(*ranks)[0, 1]) if len(p) > 1 else float("nan"),
-        "cosine": float((p @ r) / (np.linalg.norm(p) * np.linalg.norm(r) + eps)),
-        "tls_slope": float(min(tls_slope, 1 / tls_slope)),
-        "rel_rmse": float(np.linalg.norm(p - r) / (np.sqrt(np.linalg.norm(p) * np.linalg.norm(r)) + eps)),
-    }
-
-
-def eos_summary(eig: np.ndarray, threshold: float = 2.0, half_life: int = 10) -> dict[str, float | None]:
-    """Did a run reach the edge of stability, and for how long? From the normalized top eigenvalues per step:
-    - eos_step: first step whose EMA (half-life `half_life` steps) reaches 0.95 * threshold (None: never)
-    - eos_frac: fraction of the steps from eos_step on with eig > threshold (0 if never)
-    - max_ema:  max of the EMA
-    """
-    alpha = 1 - 2 ** (-1 / half_life)
-    ema = eig.astype(np.float64).copy()
-    for i in range(1, len(ema)):
-        ema[i] = alpha * eig[i] + (1 - alpha) * ema[i - 1]
-    reached = np.nonzero(ema >= 0.95 * threshold)[0]
-    first = int(reached[0]) if len(reached) else None
-    return {
-        "eos_step": first,
-        "eos_frac": float((eig[first:] > threshold).mean()) if first is not None else 0.0,
-        "max_ema": float(ema.max()),
-    }
-
-
-SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
-SERIES_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]  # second encoding: past 3 colors, hues alone aren't distinguishable
-
-
-def plot_scatter_grid(
-    preds: np.ndarray,
-    reals: np.ndarray,
-    full: np.ndarray,
-    positions: list[tuple[int, int]],
-    titles: list[str],
-    groups: list[str],
-    out_path: Path,
-    title: str = "",
-) -> list[dict[str, float]]:
-    """One panel per eval fn i, at grid cell positions[i] = (row, col), with one point per run.
-    preds, reals: [n_fns, n_runs] predicted and real values of each eval fn on each run;
-    full: [n_fns] its value on the full model; groups: [n_runs] what colors each point.
-    The agreement metrics compare the changes (pred - full, real - full); returns them per eval fn."""
-    nrows, ncols = max(r for r, _ in positions) + 1, max(c for _, c in positions) + 1
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.2 * nrows), squeeze=False)
-    used = set(positions)
-    for (r, c), ax in np.ndenumerate(axes):
-        if (r, c) not in used:
-            fig.delaxes(ax)
-    categories = list(dict.fromkeys(groups))
-    group_idx = np.array([categories.index(g) for g in groups])
-    all_metrics = []
-    for i, (r, c) in enumerate(positions):
-        ax, x, y, f = axes[r, c], preds[i], reals[i], full[i]
-        m = agreement_metrics(x - f, y - f)
-        all_metrics.append(m)
-        lo, hi = min(x.min(), y.min(), f), max(x.max(), y.max(), f)
-        pad = 0.05 * (hi - lo + 1e-12)
-        lo, hi = lo - pad, hi + pad
-        ax.plot([lo, hi], [lo, hi], color="#52514e", lw=1, ls="--", zorder=1)
-        ax.axhline(f, color="#a3a29b", lw=0.8, zorder=0)
-        ax.axvline(f, color="#a3a29b", lw=0.8, zorder=0)
-        for k, cat in enumerate(categories):
-            sel = group_idx == k
-            ax.scatter(
-                x[sel], y[sel], s=30, color=SERIES_COLORS[k % len(SERIES_COLORS)],
-                marker=SERIES_MARKERS[k % len(SERIES_MARKERS)], edgecolors="white", linewidths=0.6,
-                label=cat, zorder=2,
-            )
-        info = f"full-data loss: {f:.4f}\n" + "\n".join(f"{k}: {v:.3f}" for k, v in m.items())
-        ax.text(0.03, 0.97, info, transform=ax.transAxes, fontsize=8, va="top", color="#0b0b0b",
-                bbox=dict(boxstyle="round", facecolor="white", edgecolor="#d6d5cf", alpha=0.9))
-        ax.set(xlim=(lo, hi), ylim=(lo, hi), aspect="equal")
-        ax.set_title(titles[i], fontsize=10)
-        ax.set_xlabel("predicted loss (MAGIC)", fontsize=9)
-        ax.set_ylabel("real loss (retrained)", fontsize=9)
-        ax.tick_params(labelsize=8, colors="#52514e")
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-    handles, labels = axes[positions[0]].get_legend_handles_labels()
-    fig.suptitle(title, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.legend(handles, labels, title="train data dropped from", loc="upper center", ncols=min(len(labels), 6),
-               bbox_to_anchor=(0.5, 0.955), fontsize=8, title_fontsize=8, frameon=False)
-    fig.savefig(out_path, dpi=150)
-    return all_metrics

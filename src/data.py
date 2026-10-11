@@ -121,14 +121,14 @@ class EvalLoader:
 
 @dataclass(frozen=True, kw_only=True)
 class Subset:
-    """A deterministic random subset of `frac` * (dataset size) examples, all of class `label`
-    (or of any class if None), chosen with `seed`. Training runs drop it (weight 0), and
-    evaluation functions are the mean loss over it.
+    """The `index`-th random subset of `frac` * (dataset size) examples, all of class `label`
+    (or of any class if None). Training runs drop it (weight 0), and evaluation functions are
+    the mean loss over it.
     """
 
     frac: float
     label: int | None = None
-    seed: int = 0
+    index: int = 0
 
     def mask(self, data: Dataset) -> Tensor:
         """Boolean mask [N] (on CPU), True on the selected examples."""
@@ -136,39 +136,47 @@ class Subset:
         n = round(self.frac * len(data))
         if n > len(idx):
             raise ValueError(f"{self.frac:.0%} of the {len(data)} examples is {n}, but label {self.label} has only {len(idx)}")
-        perm = torch.randperm(len(idx), generator=torch.Generator().manual_seed(self.seed))
+        perm = torch.randperm(len(idx), generator=torch.Generator().manual_seed(self.index))
         mask = torch.zeros(len(data), dtype=torch.bool)
         mask[idx[perm[:n]]] = True
         return mask
 
+    @property
+    def name(self) -> str:
+        return f"{self.frac:.1%} of " + ("all labels" if self.label is None else f"label {self.label}") + f" #{self.index}"
+
+    @property
+    def dirname(self) -> str:
+        return self.name.replace("% of ", "pct_").replace(" ", "_").replace("#", "")
+
 
 @dataclass(frozen=True, kw_only=True)
 class Perturbation:
-    """A deterministic change of the per-example training weights w (1 = unchanged), chosen with `seed`:
+    """The `index`-th random change of the per-example training weights w (1 = unchanged):
     - kind "drop": w = 0 on a random `alpha` fraction of the examples (of class `label` if given, see `Subset`)
-    - kind "randn": w = 1 + alpha * N(0, 1) on every example (continuous in alpha; RMS of w - 1 = alpha)
+    - kind "randn": w = 1 + N(0, alpha) (variance alpha) on every example: continuous in alpha, and
+      ||w - 1||^2 = alpha * N like a drop of a fraction alpha
     """
 
     kind: str = "drop"
     alpha: float
     label: int | None = None
-    seed: int = 0
+    index: int = 0
 
     def weights(self, data: Dataset) -> Tensor:
         """The weights [N] (on CPU)."""
         if self.kind == "drop":
-            return (~Subset(frac=self.alpha, label=self.label, seed=self.seed).mask(data)).to(torch.get_default_dtype())
+            return (~Subset(frac=self.alpha, label=self.label, index=self.index).mask(data)).to(torch.get_default_dtype())
         assert self.kind == "randn" and self.label is None, self
-        return 1 + self.alpha * torch.randn(len(data), generator=torch.Generator().manual_seed(self.seed))
+        return 1 + self.alpha**0.5 * torch.randn(len(data), generator=torch.Generator().manual_seed(self.index))
 
     @property
     def group(self) -> str:
-        """What the perturbation does, without the seed (e.g. to color points)."""
+        """What the perturbation does, without the index (e.g. to color points)."""
         if self.kind == "randn":
             return f"randn {self.alpha:g}"
         return f"drop {self.alpha:.1%} of " + ("all labels" if self.label is None else f"label {self.label}")
 
     @property
-    def name(self) -> str:
-        return self.group.replace(" of ", "_").replace(" ", "_").replace("%", "pct") + f"_seed_{self.seed}"
-
+    def dirname(self) -> str:
+        return self.group.replace(" of ", "_").replace(" ", "_").replace("%", "pct") + f"_{self.index}"
