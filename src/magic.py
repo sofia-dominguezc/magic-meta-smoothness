@@ -2,6 +2,7 @@ import math
 from tqdm import tqdm
 from typing import Callable, Iterator
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 from torch import Tensor, nn
@@ -86,7 +87,7 @@ class Magic:
     """Training of `model` on `loader`, and MAGIC
     - train: plain training, supports multiple data weightings
     - train_logged: one training with logs
-    - backward_pass: MAGIC, compute the effect of weights df(s_T)/dw on model training
+    - backprop: MAGIC, compute the effect of weights df(s_T)/dw on model training
     """
 
     model: nn.Module
@@ -105,8 +106,9 @@ class Magic:
     def device(self) -> torch.device | str | None:
         return self.loader.device
 
-    def _loss(self, params: dict[str, Tensor], weights: Tensor, X: Tensor, Y: Tensor) -> Tensor:
-        """The training objective of one step: the `weights`-weighted mean loss on the batch."""
+    @partial(torch.func.grad, argnums=1)
+    def _grad(self, params: dict[str, Tensor], weights: Tensor, X: Tensor, Y: Tensor) -> Tensor:
+        """The training objective of one step with samples weighted by `weights`"""
         out = model_call(self.model, params, X, dtype=self.compute_dtype)
         return (weights * self.loss_fn(out, Y)).mean()
 
@@ -121,12 +123,12 @@ class Magic:
         state = init_state.apply(lambda t: t.to(self.device, non_blocking=True, copy=True))
         if weights is None:
             weights = torch.ones(len(self.loader.dataset)).to(self.device, non_blocking=True)
-            grad_fn = torch.func.grad(self._loss)
+            grad_fn = self._grad
         else:
             weights = weights.to(self.device, non_blocking=True)
             state = state.apply(lambda t: t.expand(len(weights), *t.shape).clone())
             grad_fn = torch.func.vmap(
-                torch.func.grad(self._loss), in_dims=(0, 0, None, None), chunk_size=self.chunk_size
+                self._grad, in_dims=(0, 0, None, None), chunk_size=self.chunk_size
             )
         if self.compile:
             grad_fn = torch.compile(grad_fn)
@@ -167,7 +169,7 @@ class Magic:
             state = state.step(grads)
 
             if tangent is not None:
-                tangent = state.apply(lambda s: fwAD.unpack_dual(s).tangent.detach())  # type: ignore
+                tangent = state.apply(lambda s: fwAD.unpack_dual(s).tangent.detach())
                 fwAD.exit_dual_level()
             state = state.apply(lambda t: t.detach())
 
@@ -224,12 +226,12 @@ class Magic:
             next(inner)  # its final state, already yielded
             yield from inner
 
-    def backward_pass(
+    def backprop(
         self, init_state: OptimState, *, n_steps: int, start: int = 0,
         eval_loaders: dict[str, EvalLoader], passes: int = 2,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        """MAGIC over the steps [start, start + n_steps) from `init_state`, for the eval functions
-        f = "mean loss over the examples of each eval loader" (named by the dict keys).
+        """MAGIC: backpropagate the eval functions f = "mean loss over each eval loader"
+        through the training steps [start, start + n_steps) from `init_state`.
 
         Returns: ({name: f(s_T)}, {name: df(s_T)/dw}).
         Cost: `1 + passes + #fns` trainings; memory: `passes * n_steps^(1/passes) + #fns` states.
@@ -238,6 +240,26 @@ class Magic:
             return {}, {}
         states = self.rewind(init_state, n_steps=n_steps, start=start, passes=passes)
         final_state = next(states).apply(lambda t: t.to(self.device))  # 1x training
+
+        def backprop_step(
+            state: OptimState, X: Tensor, Y: Tensor, delta: dict[str, dict[str, Tensor]]
+        ) -> tuple[dict[str, dict[str, Tensor]], Tensor]:
+            """(df/ds_t, df/dw_t) = ds_{t+1} / d(s_t, w_t) @ df/ds_{t+1} for all `f`.
+            Cost: `1 + #fns` trainings
+            """
+
+            def step_fn(
+                param_groups: dict[str, dict[str, Tensor]], weights: Tensor
+            ) -> dict[str, dict[str, Tensor]]:
+                s = replace(state, **param_groups)
+                return s.step(self._grad(s.params, weights, X, Y)).param_groups
+
+            weights = torch.ones(len(Y), dtype=X.dtype, device=X.device)
+            _, vjp_fn = torch.func.vjp(step_fn, state.param_groups, weights)
+            return torch.func.vmap(vjp_fn, chunk_size=self.chunk_size)(delta)
+
+        if self.compile:  # NOTE: it may break on Adam because of `t`
+            backprop_step = torch.compile(backprop_step)
 
         outputs: dict[str, Tensor] = {}  # f(s_T)
         betas: dict[str, Tensor] = {}    # df/dw
@@ -253,22 +275,10 @@ class Magic:
                 t[i] = g
 
         steps = reversed(range(start, start + n_steps))
-        for t, state in zip(steps, tqdm(states, total=n_steps)):  # `passes` trainings
+        for t, state in zip(steps, tqdm(states, total=n_steps)):  # `passes - 1` trainings
             X, Y, indices = self.loader.get(t)
             state = state.apply(lambda t: t.to(self.device, non_blocking=True))
-            weights = torch.ones(len(indices), device=self.device)
-
-            def step_fn(
-                param_groups: dict[str, dict[str, Tensor]], weights: Tensor
-            ) -> dict[str, dict[str, Tensor]]:
-                s = replace(state, **param_groups)
-                grads = torch.func.grad(self._loss)(s.params, weights, X, Y)
-                return s.step(grads).param_groups
-
-            _, vjp_fn = torch.func.vjp(step_fn, state.param_groups, weights)  # 1x training
-            d_state, d_weights = torch.func.vmap(vjp_fn, chunk_size=self.chunk_size)(
-                delta.param_groups  # 1x training (double-bwd) per `fn`
-            )
+            d_state, d_weights = backprop_step(state, X, Y, delta.param_groups)
             delta = replace(delta, **d_state)
             for i, name in enumerate(eval_loaders):
                 betas[name].index_add_(0, indices, d_weights[i])

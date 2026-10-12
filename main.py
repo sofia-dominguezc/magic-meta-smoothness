@@ -219,7 +219,7 @@ def run_magic(exp_dir, device, compile, chunk_size, labels, frac, n_subsets, pas
     magic = exp.magic(model, logger=logger)
     if cfg.start > 0:  # the state at `start`
         init_state, _ = magic.train(init_state, n_steps=cfg.start)
-    outputs, betas = magic.backward_pass(
+    outputs, betas = magic.backprop(
         init_state, n_steps=cfg.n_steps - cfg.start, start=cfg.start,
         eval_loaders={s.name: exp.eval_loader(s) for s in subsets}, passes=passes,
     )
