@@ -67,31 +67,20 @@ DATASETS = {"mnist": partial(Images, "MNIST"), "cifar10": partial(Images, "CIFAR
 
 @dataclass
 class Loader:
-    """Random batches deterministic in `step`, with per-example weights from step `weights_from` on (all ones before)."""
+    """Random batches deterministic in `step`."""
 
     dataset: Dataset
     batch_size: int = 32
     device: torch.device | str | None = None
-    weights: Tensor | None = None  # [N] on CPU; None -> all ones
-    weights_from: int = 0
     seed: int = 0
 
-    def __post_init__(self):
-        if self.weights is None:
-            self.weights = torch.ones(len(self.dataset))
-
-    def _to_device(self, t: Tensor) -> Tensor:
-        return t.to(self.device, non_blocking=True)
-
-    def get(self, step: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Returns (X, Y, indices, weights) for `step`, on `device`."""
-        assert self.weights is not None
+    def get(self, step: int) -> tuple[Tensor, Tensor, Tensor]:
+        """Returns (X, Y, indices) for `step`, on `device`."""
         g = torch.Generator().manual_seed((self.seed << 32) + step)
         idx = torch.randint(len(self.dataset), (self.batch_size,), generator=g)
         X, Y = self.dataset.get_batch(idx)
-        w = self.weights[idx] if step >= self.weights_from else torch.ones(len(idx))
-        X, Y, idx, w = map(self._to_device, (X, Y, idx, w))
-        return X, Y, idx, w
+        X, Y, idx = (t.to(self.device, non_blocking=True) for t in (X, Y, idx))
+        return X, Y, idx
 
 
 @dataclass

@@ -8,7 +8,7 @@ https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L1
 """
 
 def torch_lobpcg(
-    A: Callable[[torch.Tensor], torch.Tensor], X: torch.Tensor, max_iter=100, rtol=1e-3
+    A: Callable[[torch.Tensor], torch.Tensor], X: torch.Tensor, max_iter=100, rtol=1e-2
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Finds the top k eigenvalues/eigenvectors of the n x n linear operator A.
 

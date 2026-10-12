@@ -23,12 +23,11 @@ from pathlib import Path
 import click
 import matplotlib.pyplot as plt
 import torch
-from tqdm import tqdm
 
 from src.data import DATASETS, Dataset, EvalLoader, Loader, Perturbation, Subset
-from src.magic import LOSSES, AdamState, Magic, OptimState, SGDMomentumState, SGDState
-from src.models import MODELS, adam_lr_mults
-from src.utils import Logger
+from src.magic import LOSSES, Magic
+from src.models import MODELS, AdamState, OptimState, SGDMomentumState, SGDState, adam_lr_mults
+from src.logging import Logger
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -45,16 +44,22 @@ class ExperimentConfig:
     weight_decay: float = 0.0
     n_steps: int = 400
     start: int = 0  # the training weights are perturbed / differentiated from this step on
-    dtype: str = "float32"  # float32, float64, or bf16 (mixed precision: float32 parameters, bfloat16 model forward)
+    dtype: str = "fp32"  # of the states, losses and df/dw: fp32 or fp64
+    compute_dtype: str | None = None  # of the model forward: fp32, fp64 or bf16 (None: dtype)
+
+
+DTYPES = {"fp32": torch.float32, "fp64": torch.float64, "bf16": torch.bfloat16}
 
 
 class Experiment:
-    """An experiment dir with its saved config, datasets, and (deterministic) model + initial state."""
+    """An experiment dir with its saved config, datasets, and (deterministic) model + initial state.
+    `compile` torch.compiles the plain training passes, `chunk_size` is vmap's (see `Magic`)."""
 
-    def __init__(self, dir: Path, device: str):
-        self.dir, self.device = dir, device
+    def __init__(self, dir: Path, device: str, compile: bool = False, chunk_size: int | None = None):
+        self.dir, self.device, self.compile, self.chunk_size = dir, device, compile, chunk_size
         self.cfg = ExperimentConfig(**json.loads((dir / "config.json").read_text()))
-        torch.set_default_dtype(torch.float64 if self.cfg.dtype == "float64" else torch.float32)
+        torch.set_default_dtype(DTYPES[self.cfg.dtype])
+        self.compute_dtype = None if self.cfg.compute_dtype in (None, self.cfg.dtype) else DTYPES[self.cfg.compute_dtype]
         self.loss_fn = LOSSES[self.cfg.loss]
         self.train_ds: Dataset = DATASETS[self.cfg.dataset](train=True)
         self.test_ds: Dataset = DATASETS[self.cfg.dataset](train=False)
@@ -72,14 +77,6 @@ class Experiment:
             raise click.UsageError(f"no learning rate in {self.dir / 'config.json'}: run experiments/tune_lr.py first")
         torch.manual_seed(cfg.init_seed)
         model = MODELS[cfg.model](self.train_ds.in_shape, self.train_ds.out_dim).to(self.device)
-        if cfg.dtype == "bf16":  # the model's forward runs in bfloat16, its outputs (so the loss) in float32
-            forward, device_type = model.forward, torch.device(self.device).type
-
-            def forward_bf16(x):
-                with torch.autocast(device_type, torch.bfloat16):
-                    return forward(x).float()
-
-            model.forward = forward_bf16
         params = {k: p.detach().clone() for k, p in model.named_parameters()}
         if cfg.optimizer == "adam":
             betas = (0.9 if cfg.momentum is None else cfg.momentum, 0.999)
@@ -90,11 +87,11 @@ class Experiment:
             state = SGDState(params=params, lr=lr, weight_decay=cfg.weight_decay)
         return model, state
 
-    def magic(self, model: torch.nn.Module, weights: torch.Tensor | None = None, logger: Logger | None = None, **kwargs) -> Magic:
-        """Training (and MAGIC) of `model` with the per-example train weights `weights` (None: all ones) from step cfg.start on."""
-        loader = Loader(self.train_ds, self.cfg.batch_size, seed=self.cfg.data_seed, device=self.device,
-                        weights=weights, weights_from=self.cfg.start)
-        return Magic(model, loader, self.loss_fn, logger, **kwargs)
+    def magic(self, model: torch.nn.Module, logger: Logger | None = None, **kwargs) -> Magic:
+        """Training (and MAGIC) of `model` on the experiment's data."""
+        loader = Loader(self.train_ds, self.cfg.batch_size, seed=self.cfg.data_seed, device=self.device)
+        return Magic(model=model, loader=loader, loss_fn=self.loss_fn, logger=logger, compute_dtype=self.compute_dtype, compile=self.compile,
+                     chunk_size=self.chunk_size, **kwargs)
 
     def eval_loader(self, subset: Subset) -> EvalLoader:
         """The examples of `subset` of the test set."""
@@ -107,6 +104,8 @@ def parse_labels(ctx, param, value: str) -> list[int | None]:
 
 exp_dir = click.argument("exp_dir", type=click.Path(path_type=Path, file_okay=False))
 device_option = click.option("--device", type=str, default="cpu", show_default=True)
+compile_option = click.option("--compile/--no-compile", default=False, help="torch.compile the plain (unlogged) training passes")
+chunk_option = click.option("--chunk-size", type=int, default=None, help="vmap chunk size: retrained models / eval functions processed at once (default: all)")
 show_option = click.option("--show/--no-show", default=True, help="show the plots")
 labels_option = click.option("--labels", type=str, default="all", callback=parse_labels, help="comma-separated labels, 'all' = any class")
 
@@ -130,7 +129,8 @@ def main():
 @click.option("--weight-decay", type=float, default=0.0, show_default=True)
 @click.option("--n-steps", type=int, default=400, show_default=True)
 @click.option("--start", type=int, default=0, show_default=True, help="perturb / differentiate the training weights from this step on (trained on all the data before)")
-@click.option("--dtype", type=click.Choice(["float32", "float64", "bf16"]), default="float32", show_default=True, help="bf16: mixed precision (float32 parameters, bfloat16 forward)")
+@click.option("--dtype", type=click.Choice(["fp32", "fp64"]), default="fp32", show_default=True, help="of the states, losses and df/dw")
+@click.option("--compute-dtype", type=click.Choice(list(DTYPES)), default=None, help="of the model forward (default: --dtype); bf16 = mixed precision")
 def new(exp_dir: Path, **kwargs):
     cfg = ExperimentConfig(**kwargs)
     path = exp_dir / "config.json"
@@ -146,6 +146,8 @@ def new(exp_dir: Path, **kwargs):
               "of the data (--kind drop), or adding N(0, alpha) to every weight (--kind randn; same ||w - 1|| as drop). Existing models are skipped.")
 @exp_dir
 @device_option
+@compile_option
+@chunk_option
 @click.option("--kind", type=click.Choice(["drop", "randn"]), default="drop", show_default=True)
 @click.option("--alpha", type=float, default=0.05, show_default=True, help="size of the perturbation")
 @labels_option
@@ -155,9 +157,9 @@ def new(exp_dir: Path, **kwargs):
 @click.option("--eval-every", type=int, default=50, show_default=True, help="full model only: log the test loss and metrics every this many steps (0: never)")
 @click.option("--eval-frac", type=float, default=0.1, show_default=True, help="full model only: fraction of the test set (a fixed random subset) the test loss is logged on")
 @show_option
-def retrain(exp_dir, device, kind, alpha, labels, n_subsets, num_top_eigs, log_tangent, eval_every, eval_frac, show):
+def retrain(exp_dir, device, compile, chunk_size, kind, alpha, labels, n_subsets, num_top_eigs, log_tangent, eval_every, eval_frac, show):
     """Only the full model is logged; the retrained models only save their final state."""
-    exp = Experiment(exp_dir, device)
+    exp = Experiment(exp_dir, device, compile, chunk_size)
     cfg = exp.cfg
     model, init_state = exp.build()
 
@@ -168,9 +170,9 @@ def retrain(exp_dir, device, kind, alpha, labels, n_subsets, num_top_eigs, log_t
         logger = Logger(exp.name)
         magic = exp.magic(
             model, logger=logger, test_loader=exp.eval_loader(Subset(frac=eval_frac)) if eval_every else None,
-            eval_every=eval_every, num_top_eigs=num_top_eigs, log_tangent=log_tangent,
+            eval_every=eval_every, n_eigs=num_top_eigs, log_tangent=log_tangent,
         )
-        final, _ = magic.forward_pass(init_state, n_steps=cfg.n_steps, log=True)
+        final = magic.train_logged(init_state, n_steps=cfg.n_steps)
         torch.save(asdict(final), full_dir / "final.pt")
         logger.finish(full_dir / "metrics.pt")
         if show:
@@ -179,13 +181,16 @@ def retrain(exp_dir, device, kind, alpha, labels, n_subsets, num_top_eigs, log_t
 
     labels = [None] if kind == "randn" else labels
     perturbations = [Perturbation(kind=kind, alpha=alpha, label=label, index=i) for label in labels for i in range(n_subsets)]
-    for p in tqdm(perturbations, desc="retrained models"):
+    perturbations = [p for p in perturbations if not (exp_dir / "retrained" / p.dirname / "final.pt").exists()]
+    if not perturbations:
+        return
+    click.echo(f"training {len(perturbations)} models at once" + (f", {chunk_size} at a time" if chunk_size else ""))
+    weights = torch.stack([p.weights(exp.train_ds) for p in perturbations])  # [R, N]
+    final, _ = exp.magic(model).train(init_state, n_steps=cfg.n_steps, weights=weights, weights_from=cfg.start)
+    for r, p in enumerate(perturbations):
         run_dir = exp_dir / "retrained" / p.dirname
-        if (run_dir / "final.pt").exists():
-            continue
         run_dir.mkdir(parents=True, exist_ok=True)
-        final, _ = exp.magic(model, weights=p.weights(exp.train_ds)).forward_pass(init_state, n_steps=cfg.n_steps)
-        torch.save(asdict(final), run_dir / "final.pt")
+        torch.save(asdict(final.apply(lambda t: t[r])), run_dir / "final.pt")
         (run_dir / "perturbation.json").write_text(json.dumps(asdict(p)))
 
 
@@ -193,13 +198,15 @@ def retrain(exp_dir, device, kind, alpha, labels, n_subsets, num_top_eigs, log_t
               "for the training weights of the steps from `start` on. Saves to DIR/magic; existing eval subsets are skipped.")
 @exp_dir
 @device_option
+@compile_option
+@chunk_option
 @labels_option
 @click.option("--frac", type=float, default=0.1, show_default=True, help="fraction of the test set in each eval subset (all from one label for label subsets)")
 @click.option("--n-subsets", type=int, default=1, show_default=True, help="eval subsets per label (indices 0, ..., n-1)")
 @click.option("--passes", type=int, default=2, show_default=True, help="re-trainings to reconstruct the states in reverse (memory: passes * steps^(1/passes) states)")
 @show_option
-def run_magic(exp_dir, device, labels, frac, n_subsets, passes, show):
-    exp = Experiment(exp_dir, device)
+def run_magic(exp_dir, device, compile, chunk_size, labels, frac, n_subsets, passes, show):
+    exp = Experiment(exp_dir, device, compile, chunk_size)
     cfg = exp.cfg
     model, init_state = exp.build()
     magic_dir = exp_dir / "magic"
@@ -211,7 +218,7 @@ def run_magic(exp_dir, device, labels, frac, n_subsets, passes, show):
     logger = Logger(f"MAGIC: norms of df/ds_t, f = loss on {frac:.1%} of the test set; {exp.name}")
     magic = exp.magic(model, logger=logger)
     if cfg.start > 0:  # the state at `start`
-        init_state, _ = magic.forward_pass(init_state, n_steps=cfg.start)
+        init_state, _ = magic.train(init_state, n_steps=cfg.start)
     outputs, betas = magic.backward_pass(
         init_state, n_steps=cfg.n_steps - cfg.start, start=cfg.start,
         eval_loaders={s.name: exp.eval_loader(s) for s in subsets}, passes=passes,

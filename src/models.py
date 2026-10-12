@@ -14,10 +14,12 @@ tensors (w, b_raw) and computes
 Seed with torch.manual_seed before creating a model."""
 
 import math
+from dataclasses import dataclass, replace
+from typing import Callable, ClassVar, Iterator, Self
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
+import torch.nn.functional as F
 
 
 def mu_init_(layer: nn.Linear | nn.Conv2d, readout: bool = False):
@@ -159,3 +161,147 @@ def adam_lr_mults(model: nn.Module) -> dict[str, float]:
             mults[name] = (fan_in * fan_out) ** -0.5
     return mults
 
+
+def dict_zip[T](*dicts: dict[str, T]) -> dict[str, tuple[T, ...]]:
+    """e.g. {"a": 1, "b": 2}, {"a": 3, "b": 4} -> {"a": (1, 3), "b": (2, 4)}"""
+    return {key: tuple(d[key] for d in dicts) for key in dicts[0]}
+
+
+@dataclass(kw_only=True)
+class OptimState:
+    """All model + optimizer state tensors: the dict fields named in `groups`."""
+
+    groups: ClassVar[tuple[str, ...]] = ("params",)
+    params: dict[str, Tensor]  # model parameters
+
+    @property
+    def param_groups(self) -> dict[str, dict[str, Tensor]]:
+        return {group: getattr(self, group) for group in self.groups}
+
+    def __iter__(self) -> Iterator[Tensor]:
+        return (t for group in self.param_groups.values() for t in group.values())
+
+    def apply(self, fn: Callable[[Tensor], Tensor]) -> Self:
+        """Apply `fn` to each state tensor. Returns a new OptimState."""
+        new_fields = {
+            group_name: {name: fn(tensor) for name, tensor in group.items()}
+            for group_name, group in self.param_groups.items()
+        }
+        return replace(self, **new_fields)
+
+    def unflatten(self, tensors: list[Tensor]) -> Self:
+        """Inverse of iterating: a state like this one holding `tensors` instead."""
+        it = iter(tensors)
+        return self.apply(lambda _: next(it))
+
+    def step(self, grads: dict[str, Tensor]) -> Self:
+        """Update state tensors. Returns a new OptimState."""
+        raise NotImplementedError
+
+    @property
+    def precond(self) -> dict[str, Tensor] | None:
+        """Per-element multiplier of the gradient in the update, up to `lr` (None: 1). The Hessian
+        eigenvalues to compare with `stability_threshold` are those of the preconditioned Hessian."""
+        return None
+
+    @property
+    def stability_threshold(self) -> float:
+        """Top (preconditioned) Hessian eigenvalue above which the step is unstable (edge of stability)."""
+        raise NotImplementedError
+
+
+@dataclass(kw_only=True)
+class SGDState(OptimState):
+    lr: float
+    weight_decay: float = 0.0
+
+    def step(self, grads: dict[str, Tensor]) -> Self:
+        new_params = {
+            name: p - self.lr * (g + self.weight_decay * p)
+            for name, (p, g) in dict_zip(self.params, grads).items()
+        }
+        return replace(self, params=new_params)
+
+    @property
+    def stability_threshold(self) -> float:
+        return 2 / self.lr
+
+
+@dataclass(kw_only=True)
+class SGDMomentumState(SGDState):
+    groups = ("params", "buffer")
+    momentum: float = 0.9
+    buffer: dict[str, Tensor] | None = None  # None -> zeros
+
+    def __post_init__(self):
+        if self.buffer is None:
+            self.buffer = {k: torch.zeros_like(p) for k, p in self.params.items()}
+
+    def step(self, grads: dict[str, Tensor]) -> Self:
+        assert self.buffer is not None
+        new_buffer = {
+            name: self.momentum * buf + g + self.weight_decay * p
+            for name, (p, buf, g) in dict_zip(self.params, self.buffer, grads).items()
+        }
+        new_params = {
+            name: p - self.lr * buf
+            for name, (p, buf) in dict_zip(self.params, new_buffer).items()
+        }
+        return replace(self, params=new_params, buffer=new_buffer)
+
+    @property
+    def stability_threshold(self) -> float:
+        return 2 * (1 + self.momentum) / self.lr
+
+
+@dataclass(kw_only=True)
+class AdamState(OptimState):
+    """Adam as in torch.optim.Adam (L2 weight decay), with per-parameter learning rate
+    multipliers `lr_mults` (None: 1; `models.adam_lr_mults` for μP)."""
+
+    groups = ("params", "m", "v")
+    lr: float
+    lr_mults: dict[str, float] | None = None
+    betas: tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    weight_decay: float = 0.0
+    t: int = 0  # steps taken
+    m: dict[str, Tensor] | None = None  # None -> zeros
+    v: dict[str, Tensor] | None = None
+
+    def __post_init__(self):
+        if self.lr_mults is None:
+            self.lr_mults = {k: 1.0 for k in self.params}
+        if self.m is None:
+            self.m = {k: torch.zeros_like(p) for k, p in self.params.items()}
+        if self.v is None:
+            self.v = {k: torch.zeros_like(p) for k, p in self.params.items()}
+
+    def _step_sizes(self, v: dict[str, Tensor], t: int) -> dict[str, Tensor]:
+        """Per-element multiplier of m in the update at step t, up to lr: mult / (bias-corrected sqrt(v) + eps)."""
+        assert self.lr_mults is not None
+        b1, b2 = self.betas
+        return {k: self.lr_mults[k] / (1 - b1**t) / (v_k.sqrt() / (1 - b2**t) ** 0.5 + self.eps) for k, v_k in v.items()}
+
+    def step(self, grads: dict[str, Tensor]) -> Self:
+        assert self.m is not None and self.v is not None
+        b1, b2 = self.betas
+        t = self.t + 1
+        grads = {k: g + self.weight_decay * p for k, (g, p) in dict_zip(grads, self.params).items()}
+        new_m = {k: b1 * m + (1 - b1) * g for k, (m, g) in dict_zip(self.m, grads).items()}
+        new_v = {k: b2 * v + (1 - b2) * g * g for k, (v, g) in dict_zip(self.v, grads).items()}
+        new_params = {
+            k: p - self.lr * size * m
+            for k, (p, m, size) in dict_zip(self.params, new_m, self._step_sizes(new_v, t)).items()
+        }
+        return replace(self, params=new_params, m=new_m, v=new_v, t=t)
+
+    @property
+    def precond(self) -> dict[str, Tensor]:
+        assert self.v is not None
+        return self._step_sizes(self.v, max(self.t, 1))
+
+    @property
+    def stability_threshold(self) -> float:
+        """Cohen et al. 2022, "Adaptive gradient methods at the edge of stability": 38/lr for beta1 = 0.9."""
+        return 2 * (1 + self.betas[0]) / ((1 - self.betas[0]) * self.lr)

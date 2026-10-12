@@ -8,11 +8,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def dict_zip[T](*dicts: dict[str, T]) -> dict[str, tuple[T, ...]]:
-    """e.g. {"a": 1, "b": 2}, {"a": 3, "b": 4} -> {"a": (1, 3), "b": (2, 4)}"""
-    return {key: tuple(d[key] for d in dicts) for key in dicts[0]}
-
-
 def op_norm(t: Tensor, u: Tensor | None = None, n_iter: int = 3) -> tuple[Tensor, Tensor | None]:
     """Operator norm of a parameter-shaped tensor, without syncs:
     - vectors (ndim <= 1): the L2 norm
@@ -51,7 +46,7 @@ class Logger:
         self.flush_every = flush_every
         self._buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)
         self._history: dict[str, list[tuple[list[int], Tensor]]] = defaultdict(list)  # (steps, values) per flush
-        self._u: dict[str, Tensor | None] = {}  # power iteration vectors, by metric name
+        self._running_eigs: dict[str, Tensor | None] = {}
         self._norm_panels: set[str] = set()
 
     def log(self, step: int, **values: Tensor):
@@ -70,9 +65,9 @@ class Logger:
             self._norm_panels.add(panel)
             for k, t in group_tensors.items():
                 key = f"{panel}/{k}"
-                if (u := self._u.get(key)) is None:
+                if (u := self._running_eigs.get(key)) is None:
                     u = op_norm(t, None, n_iter=10)[1]
-                norm, self._u[key] = op_norm(t, u, n_iter=3)
+                norm, self._running_eigs[key] = op_norm(t, u, n_iter=3)
                 self._buf[key].append((step, norm))
         self._maybe_flush()
 

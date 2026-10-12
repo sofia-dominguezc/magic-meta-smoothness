@@ -3,7 +3,7 @@ __pycache__/
 images/
 .pytest_cache/
 experiments/
-test_new/
+test/
 results/
 wandb/
 NOTES.md
