@@ -40,9 +40,7 @@ from scipy.spatial.distance import squareform
 from torch import Tensor
 
 from main import Experiment
-from src.data import EvalLoader, Subset
-from src.eigvals import top_hessian_eigs
-from src.magic import Magic, model_call
+from src.magic import hessian_eigs, model_call
 
 
 def spec_norm(t: Tensor) -> Tensor:
@@ -68,19 +66,18 @@ def flat(params: dict[str, Tensor]) -> Tensor:
     return torch.cat([p.double().flatten() for p in params.values()])
 
 
-def example_losses(magic: Magic, params: dict[str, Tensor], loader: EvalLoader) -> Tensor:
-    """Per-example losses [len(loader)] of the model `params` (on CPU)."""
-    params = {k: p.to(magic.device) for k, p in params.items()}
+def example_losses(exp: Experiment, params: dict[str, Tensor], indices: Tensor) -> Tensor:
+    """Per-example losses [len(indices)] of the model `params` on the test examples `indices` (on CPU)."""
+    params = {k: p.to(exp.device) for k, p in params.items()}
     with torch.no_grad():
-        return torch.cat([magic.loss_fn(model_call(magic.model, params, X, bf16=magic.bf16), Y).cpu() for X, Y in loader])
+        return torch.cat([exp.loss_fn(model_call(exp.model, params, X, bf16=exp.bf16), Y).cpu()
+                          for X, Y in exp.test_loader.iter_batches(indices)])
 
 
 def train(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int, direction: str, ckpt_every: int):
     """Train center + n perturbed models (vmapped) and the plain reference; save them to out_dir/models.pt."""
-    cfg = exp.cfg
-    model, init_state = exp.build()
-    magic = exp.magic(model)
-    start_state = exp.start_state(magic, init_state).apply(lambda t: t.cpu())
+    cfg, magic = exp.cfg, exp.magic
+    start_state = exp.start_state.apply(lambda t: t.cpu())
     directions = [DIRECTIONS[direction](start_state.params, i) for i in range(1, n_models + 1)]
     batched = start_state.apply(lambda t: t.expand(n_models + 1, *t.shape).clone())
     for i, d in enumerate(directions, 1):
@@ -88,9 +85,7 @@ def train(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int,
             batched.params[k][i] += eps * t
     click.echo(f"training the reference and {n_models + 1} models (vmapped) for {steps} steps from step {cfg.start}")
     ref_final, ref_ckpts = magic.train(start_state, n_steps=steps, start=cfg.start, ckpt_every=ckpt_every)
-    final, ckpts = magic.train(
-        batched, n_steps=steps, start=cfg.start, ckpt_every=ckpt_every, weights=torch.ones(n_models + 1, len(exp.train_ds))
-    )
+    final, ckpts = magic.train(batched, n_steps=steps, start=cfg.start, ckpt_every=ckpt_every)  # batched state: vmapped
     torch.cuda.empty_cache()  # release the trainings' peak (kept reserved by the caching allocator; a no-op on cpu)
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -102,17 +97,14 @@ def train(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int,
 
 def analyze(exp: Experiment, out_dir: Path, n_test: int, n_eigs: int, show: bool) -> dict:
     """Everything in results.json and the plots, from out_dir/models.pt."""
-    cfg = exp.cfg
+    cfg, magic, start_state = exp.cfg, exp.magic, exp.start_state
     saved = torch.load(out_dir / "models.pt", weights_only=True)
-    model, init_state = exp.build()
-    magic = exp.magic(model)
-    start_state = exp.start_state(magic, init_state)
-    states = [type(init_state)(**s) for s in saved["states"]]
-    refs = [type(init_state)(**s) for s in saved["ref_states"]]
+    states = [type(start_state)(**s) for s in saved["states"]]
+    refs = [type(start_state)(**s) for s in saved["ref_states"]]
     steps, directions, eps = np.array(saved["steps"]), saved["directions"], saved["eps"]
     n = len(directions)
     rows = ["center", *map(str, range(1, n + 1)), "ref"]
-    test_loader = exp.eval_loader(Subset(n=n_test))
+    test_idx = exp.test_ds.subset(n_test)
 
     def params_of(state, i) -> dict[str, Tensor]:  # row i of a batched state
         return {k: p[i] for k, p in state.params.items()}
@@ -120,8 +112,8 @@ def analyze(exp: Experiment, out_dir: Path, n_test: int, n_eigs: int, show: bool
     # over the steps: distances to the center and test losses, [n_ckpts, n + 1] (last column: ref)
     dists = np.array([[dist(params_of(s, i), params_of(s, 0)) for i in range(1, n + 1)] + [dist(r.params, params_of(s, 0))]
                       for s, r in zip(states, refs)])
-    losses = np.array([[example_losses(magic, params_of(s, i), test_loader).mean().item() for i in range(n + 1)]
-                       + [example_losses(magic, r.params, test_loader).mean().item()] for s, r in zip(states, refs)])
+    losses = np.array([[example_losses(exp, params_of(s, i), test_idx).mean().item() for i in range(n + 1)]
+                       + [example_losses(exp, r.params, test_idx).mean().item()] for s, r in zip(states, refs)])
     center = flat(params_of(states[-1], 0))
     disp = torch.stack([flat(params_of(states[-1], i)) - center for i in range(1, n + 1)])  # final displacements [n, P]
     disp_ref = flat(refs[-1].params) - center
@@ -133,7 +125,7 @@ def analyze(exp: Experiment, out_dir: Path, n_test: int, n_eigs: int, show: bool
     # final models: pairwise distances in parameter and function space, cosines of the displacements
     finals = [params_of(states[-1], i) for i in range(n + 1)] + [refs[-1].params]
     pdist = np.array([[dist(a, b) for b in finals] for a in finals])
-    ell = torch.stack([example_losses(magic, p, test_loader) for p in finals]).double().numpy()  # [n + 2, n_test]
+    ell = torch.stack([example_losses(exp, p, test_idx) for p in finals]).double().numpy()  # [n + 2, n_test]
     fdist = np.sqrt(((ell[:, None] - ell[None]) ** 2).mean(-1))
     D = torch.cat([disp, disp_ref[None]])
     Dn = D / D.norm(dim=1, keepdim=True)
@@ -142,15 +134,16 @@ def analyze(exp: Experiment, out_dir: Path, n_test: int, n_eigs: int, show: bool
     order = [0, *(1 + np.array(clustered)).tolist(), n + 1]  # center, perturbed in clustered order, ref
 
     # the directions vs. the Hessian at the start state
-    X, Y, _ = magic.loader.get(cfg.start)
-    params = {k: p.to(magic.device).requires_grad_() for k, p in start_state.params.items()}
-    loss = magic.loss_fn(model_call(magic.model, params, X, bf16=magic.bf16), Y).mean()
-    grads = torch.autograd.grad(loss, params, create_graph=True)
-    eig_names, eigvecs, eigvals = [], [], []
-    for negative in [False, True]:
-        vals, vecs, _ = top_hessian_eigs(grads, params, n_eigs, precond=start_state.precond(cfg.start), negative=negative)
-        eig_names += [f"eig {'-' if negative else ''}{i + 1}" for i in range(n_eigs)]
-        eigvecs.append(vecs.detach().cpu().double())
+    X, Y, _ = magic.loader.get_batch(cfg.start)
+    params = {k: p.to(magic.device) for k, p in start_state.params.items()}
+    vjp_fn = torch.func.vjp(lambda p: magic.grad_fn(p, X, Y), params)[1]
+    hvp = lambda v: vjp_fn(v)[0]  # v -> H v on params dicts
+    eig_names, eigvecs, eigvals, g = [], [], [], torch.Generator().manual_seed(0)
+    for sign in [1, -1]:
+        start = {k: torch.randn(n_eigs, *p.shape, generator=g, dtype=p.dtype).to(p.device) for k, p in params.items()}
+        vals, vecs, _ = hessian_eigs(hvp, start, start_state.precond(cfg.start), sign)
+        eig_names += [f"eig {'-' if sign < 0 else ''}{i + 1}" for i in range(n_eigs)]
+        eigvecs.append(torch.stack([flat({k: v[i] for k, v in vecs.items()}) for i in range(n_eigs)], 1).cpu())
         eigvals += (vals.detach().cpu() * (2 / start_state.stability_threshold)).tolist()
     V = torch.cat(eigvecs, dim=1)  # [P, 2 n_eigs]
     dirs = torch.stack([flat(d) for d in directions])

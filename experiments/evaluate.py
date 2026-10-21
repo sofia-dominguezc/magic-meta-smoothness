@@ -16,8 +16,8 @@ in DIR/evaluation:
   per-eval-subset values as faint points
 """
 
-from dataclasses import asdict
 import json
+import re
 from pathlib import Path
 
 import click
@@ -27,8 +27,12 @@ import torch
 from tqdm import tqdm
 
 from main import Experiment
-from src.data import Perturbation, Subset
 from src.magic import eval_loss
+
+
+def natural(name: str) -> list:
+    """Sort key with the numbers in `name` compared as numbers ("5_examples_2" < "5_examples_10")."""
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
 
 
 def agreement_metrics(pred: np.ndarray, real: np.ndarray) -> dict[str, float]:
@@ -139,58 +143,53 @@ def plot_alpha(groups: list[dict], out_path: Path, title: str = ""):
 def evaluate(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
     exp = Experiment(exp_dir, device)
     cfg = exp.cfg
-    model, _ = exp.build()
-    magic_dirs = [d for d in (exp_dir / "magic").glob("*") if (d / "linearization.pt").exists()]
-    subsets = [Subset(**json.loads((d / "subset.json").read_text())) for d in magic_dirs]
-    order = sorted(range(len(subsets)), key=lambda i: (subsets[i].n, subsets[i].index))
-    subsets, magic_dirs = [subsets[i] for i in order], [magic_dirs[i] for i in order]
-    if not subsets:
-        raise click.UsageError(f"no eval subsets in {exp_dir / 'magic'}")
-    lins = [torch.load(d / "linearization.pt", weights_only=True) for d in magic_dirs]
-    outputs, betas = torch.stack([l["output"] for l in lins]), torch.stack([l["beta"] for l in lins])  # [n_fns], [n_fns, N]
-    eval_loaders = [exp.eval_loader(s) for s in subsets]
-    runs = {
-        d: Perturbation(**json.loads((d / "perturbation.json").read_text()))
-        for d in sorted((exp_dir / "retrained").glob("*")) if (d / "final.pt").exists()
-    }
+    lins = {d: torch.load(d / "linearization.pt", weights_only=True)
+            for d in (exp_dir / "magic").glob("*") if (d / "linearization.pt").exists()}  # dir -> {indices, output, beta}
+    lins = dict(sorted(lins.items(), key=lambda item: (len(item[1]["indices"]), natural(item[0].name))))
+    if not lins:
+        raise click.UsageError(f"no eval sets in {exp_dir / 'magic'}")
+    eval_sets = [l["indices"] for l in lins.values()]
+    outputs, betas = torch.stack([l["output"] for l in lins.values()]), torch.stack([l["beta"] for l in lins.values()])  # [n_fns], [n_fns, N]
+    runs = {d: torch.load(d / "perturbation.pt", weights_only=True)
+            for d in sorted((exp_dir / "retrained").glob("*"), key=lambda d: natural(d.name)) if (d / "final.pt").exists()}  # dir -> {weights, kind, alpha}
     if not runs:
         raise click.UsageError(f"no retrained models in {exp_dir / 'retrained'}")
-    click.echo(f"evaluating {len(subsets)} eval subsets on {len(runs)} retrained models")
+    click.echo(f"evaluating {len(lins)} eval sets on {len(runs)} retrained models")
 
     def f(path: Path) -> torch.Tensor:
         """The eval fns on the state saved at `path`."""
-        params = {k: t.to(device) for k, t in torch.load(path, weights_only=True)["params"].items()}
-        return torch.stack([eval_loss(model, exp.loss_fn, params, loader, bf16=exp.bf16)[0] for loader in eval_loaders]).cpu()
+        params = {k: t.to(device) for k, t in exp.load_state(path).params.items()}
+        return torch.stack([eval_loss(exp.model, exp.loss_fn, params, exp.test_loader, indices, bf16=exp.bf16)[0] for indices in eval_sets]).cpu()
 
     preds, reals = [], []  # [n_fns] per run: the predicted and real change of the eval fns
     f_full = f(exp_dir / "full_model" / "final.pt")
     for run_dir, p in tqdm(runs.items(), desc="retrained models"):
-        preds.append(betas @ (p.weights(exp.train_ds) - 1).to(betas.dtype))  # f(w) - f(1) ~ betas @ (w - 1)
+        preds.append(betas @ (p["weights"] - 1).to(betas.dtype))  # f(w) - f(1) ~ betas @ (w - 1)
         reals.append(f(run_dir / "final.pt") - f_full)
     preds, reals, full = torch.stack(preds, 1).numpy(), torch.stack(reals, 1).numpy(), outputs.numpy()  # [n_fns, n_runs]
-    perts = list(runs.values())
+    perts = [(p["kind"], p["alpha"]) for p in runs.values()]
 
     out_dir = exp_dir / "evaluation"
     out_dir.mkdir(exist_ok=True)
-    rows = list(dict.fromkeys(s.n for s in subsets))  # one row per subset size, one column per index
-    cols = sorted(set(s.index for s in subsets))
-    positions = [(rows.index(s.n), cols.index(s.index)) for s in subsets]
-    titles = [f"loss on {s.name}" for s in subsets]
-    results = {"eval_subsets": [asdict(s) for s in subsets], "full": full.tolist(), "groups": []}
-    for kind, alpha in sorted(set((p.kind, p.alpha) for p in perts)):
-        sel = np.array([(p.kind, p.alpha) == (kind, alpha) for p in perts])
+    sizes = [len(indices) for indices in eval_sets]
+    rows = list(dict.fromkeys(sizes))  # one row per eval set size, one column per set of that size
+    positions = [(rows.index(n), sizes[:i].count(n)) for i, n in enumerate(sizes)]
+    titles = [f"loss on {d.name}" for d in lins]
+    results = {"eval_sets": [{"dir": d.name, "n": n} for d, n in zip(lins, sizes)], "full": full.tolist(), "groups": []}
+    for kind, alpha in sorted(set(perts)):
+        sel = np.array([p == (kind, alpha) for p in perts])
         name = f"{kind}_{alpha:g}"
         title = f"MAGIC vs. retraining with {kind} {alpha:g} from step {cfg.start}: {sel.sum()} models\n{exp.name}"
         metrics = plot_scatter_grid(preds[:, sel], reals[:, sel], full, positions, titles,
-                                    [p.name for p in perts if (p.kind, p.alpha) == (kind, alpha)], out_dir / f"{name}.png", title)
+                                    [f"{kind} {alpha:g}"] * int(sel.sum()), out_dir / f"{name}.png", title)
         pooled = agreement_metrics(preds[:, sel].ravel(), reals[:, sel].ravel())
         results["groups"].append({
-            "kind": kind, "alpha": alpha, "runs": [d.name for d, p in runs.items() if (p.kind, p.alpha) == (kind, alpha)],
+            "kind": kind, "alpha": alpha, "runs": [d.name for d, p in zip(runs, perts) if p == (kind, alpha)],
             "metrics": metrics, "pooled": pooled, "preds": preds[:, sel].tolist(), "reals": reals[:, sel].tolist(),
         })
         click.echo(f"{kind} {alpha:g}:")
-        for subset, m in zip(subsets, metrics):
-            click.echo(f"  {subset.name}: " + ", ".join(f"{k}={v:.3f}" for k, v in m.items()))
+        for d, m in zip(lins, metrics):
+            click.echo(f"  {d.name}: " + ", ".join(f"{k}={v:.3f}" for k, v in m.items()))
         click.echo(f"  pooled: " + ", ".join(f"{k}={v:.3f}" for k, v in pooled.items()))
     if len(results["groups"]) > 1:
         plot_alpha(results["groups"], out_dir / "alpha.png", f"MAGIC vs. retraining from step {cfg.start}, pooled over all eval subsets and models\n{exp.name}")

@@ -19,7 +19,7 @@ def test_cli_end_to_end(tmp_path):
     assert json.loads((tmp_path / "config.json").read_text())["lr"] in (0.05, 0.1)
     for args in [
         ["train", d, "--num-top-eigs", "2", "--num-neg-eigs", "1", "--eig-every", "2", "--eval-every", "4", "--n-test", "50", "--no-show"],
-        ["retrain", d, "--alpha", "0.025", "--n-subsets", "4"],  # + the unperturbed model, full_model/final.pt
+        ["retrain", d, "--alpha", "0.025", "--n-subsets", "4", "--vmap-limit", "3"],  # + the unperturbed model, full_model/final.pt: 5 models in 2 chunks
         ["retrain", d, "--alpha", "0.05", "--n-subsets", "2"],
         ["run-magic", d, "--n-test", "5", "--n-subsets", "2", "--no-show"],
         ["run-magic", d, "--n-test", "5", "--n-subsets", "3", "--no-show"],  # one new eval subset
@@ -31,7 +31,9 @@ def test_cli_end_to_end(tmp_path):
     results = evaluate(tmp_path, show=False)
 
     assert [(g["kind"], g["alpha"], len(g["runs"])) for g in results["groups"]] == [("drop", 0.025, 4), ("drop", 0.05, 2)]
-    assert [(s["n"], s["index"]) for s in results["eval_subsets"]] == [(5, 0), (5, 1), (5, 2), (20, 0)]
+    assert [(s["n"], s["dir"]) for s in results["eval_sets"]] == [(5, "5_examples_0"), (5, "5_examples_1"), (5, "5_examples_2"), (20, "20_examples_0")]
+    lin = torch.load(tmp_path / "magic" / "20_examples_0" / "linearization.pt", weights_only=True)
+    assert set(lin) == {"indices", "output", "beta"} and len(lin["indices"]) == 20
     assert (tmp_path / "full_model" / "final.pt").exists() and not (tmp_path / "full_model" / "start.pt").exists()
     full_metrics = torch.load(tmp_path / "full_model" / "metrics.pt", weights_only=True)
     assert {"eig/1", "eig/2", "eig/-1", "tangent/buffer/out.weight", "grads/out.weight", "test_loss"} <= set(full_metrics)
@@ -40,7 +42,9 @@ def test_cli_end_to_end(tmp_path):
     assert "delta/20 examples #0/buffer/out.weight" in magic_metrics and len(magic_metrics) == 2 * 6  # 1 subset: (params, buffer) x 6 tensors
     assert not (tmp_path / "retrained" / results["groups"][0]["runs"][0] / "metrics.pt").exists()  # retrained runs aren't logged
     for g in results["groups"]:
-        assert all(m["cosine"] > 0.9 for m in g["metrics"]) and g["pooled"]["ccc"] > 0.9  # (the ccc of a 2-run group is degenerate)
+        assert g["pooled"]["ccc"] > 0.9 and g["pooled"]["cosine"] > 0.9
+        if len(g["runs"]) >= 3:  # the per-set metrics of a 2-run group are degenerate (2 points)
+            assert all(m["cosine"] > 0.9 for m in g["metrics"])
         assert (tmp_path / "evaluation" / f"{g['kind']}_{g['alpha']:g}.png").exists()
     assert (tmp_path / "evaluation" / "alpha.png").exists() and (tmp_path / "evaluation" / "results.json").exists()
 
@@ -58,7 +62,9 @@ def test_start_and_randn(tmp_path):
     ]:
         result = runner.invoke(main, args, catch_exceptions=False)
         assert result.exit_code == 0, result.output
-    assert (tmp_path / "retrained" / "randn_0.01_2" / "final.pt").exists()
+    pert = torch.load(tmp_path / "retrained" / "randn_0.01_2" / "perturbation.pt", weights_only=True)
+    assert (tmp_path / "retrained" / "randn_0.01_2" / "final.pt").exists() and (pert["kind"], pert["alpha"]) == ("randn", 0.01)
+    assert pert["weights"].shape == (512,) and not torch.equal(pert["weights"], torch.ones(512))
     assert set(torch.load(tmp_path / "full_model" / "start.pt", weights_only=True)) == {"params", "lr", "weight_decay"}
     assert torch.load(tmp_path / "full_model" / "metrics.pt", weights_only=True)["loss"]["step"][0] == 6  # no log before `start`
     results = evaluate(tmp_path, show=False)

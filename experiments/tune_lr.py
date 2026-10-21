@@ -13,23 +13,23 @@ from pathlib import Path
 
 import click
 import matplotlib.pyplot as plt
+import torch
 from tqdm import tqdm
 
 from main import Experiment
-from src.data import EvalLoader
 from src.magic import eval_loss
 
 
 def tune_lr(exp_dir: Path, lrs: list[float], steps: int | None = None, device: str = "cpu", compile: bool = False, show: bool = True) -> float:
     exp = Experiment(exp_dir, device, compile)
+    exp = replace(exp, cfg=replace(exp.cfg, lr=lrs[0]))  # the config may have no lr yet
     steps = exp.cfg.n_steps if steps is None else steps
-    test_loader = EvalLoader(exp.test_ds, device=device)
+    all_test = torch.arange(len(exp.test_ds))
     losses, accs = [], []
     for lr in tqdm(lrs, desc="learning rates"):
-        model, init_state = exp.build(lr=lr)
-        magic = exp.magic(model)
-        final, _ = magic.train(init_state, n_steps=steps)
-        loss, metrics, _ = eval_loss(model, exp.loss_fn, {k: p.to(device) for k, p in final.params.items()}, test_loader, bf16=exp.bf16)
+        init_state = replace(exp.init_state, lr=replace(exp.init_state.lr, lr=lr))
+        final, _ = exp.magic.train(init_state, n_steps=steps)
+        loss, metrics, _ = eval_loss(exp.model, exp.loss_fn, {k: p.to(device) for k, p in final.params.items()}, exp.test_loader, all_test, bf16=exp.bf16)
         losses.append(loss.item() if math.isfinite(loss.item()) else math.inf)
         accs.append(metrics["acc"].item())
         click.echo(f"  lr {lr:g}: test loss {losses[-1]:.4f}, acc {accs[-1]:.3f}")

@@ -4,7 +4,6 @@ DIR/magic (e.g. after a change of Logger._plot_scalars / _plot_norms), without r
   python -m experiments.replot_norms DIR [DIR ...]
 """
 
-import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -39,8 +38,8 @@ def replot(metrics_path: Path, name: str, yscale=None, eos: float | None = None)
 def main(exp_dirs, yscale, show):
     for exp_dir in exp_dirs:
         exp = Experiment(exp_dir, "cpu")
-        replot(exp_dir / "full_model" / "metrics.pt", exp.name, yscale=yscale, eos=exp.build()[1].stability_threshold)
-        ns = {json.loads(p.read_text())["n"] for p in (exp_dir / "magic").glob("*/subset.json")}
+        replot(exp_dir / "full_model" / "metrics.pt", exp.name, yscale=yscale, eos=exp.init_state.stability_threshold)
+        ns = {len(torch.load(p, weights_only=True)["indices"]) for p in (exp_dir / "magic").glob("*/linearization.pt")}
         if (exp_dir / "magic" / "metrics.pt").exists():
             replot(exp_dir / "magic" / "metrics.pt", f"MAGIC: norms of df/ds_t, f = loss on {', '.join(map(str, sorted(ns)))} test examples; {exp.name}", yscale=yscale)
 

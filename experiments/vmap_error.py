@@ -28,7 +28,6 @@ import numpy as np
 import torch
 
 from main import DTYPES, Experiment
-from src.data import Subset
 from src.logging import op_norm
 from src.magic import eval_loss
 
@@ -38,14 +37,13 @@ def vmap_error(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
     cfg = exp.cfg
     ckpt_every = max(1, cfg.n_steps // 50)
     steps = [*range(0, cfg.n_steps, ckpt_every), cfg.n_steps]
-    test_loader = exp.eval_loader(Subset(n=1000))
+    test_idx = exp.test_ds.subset(1000)
     torch.set_default_dtype(torch.float64)
-    model, init_state = exp.build()  # built once: the fp32 and fp64 samplers draw different inits from the same seed
+    init_state, magic = exp.init_state, exp.magic  # built once: the fp32 and fp64 samplers draw different inits from the same seed
     results: dict = {"steps": steps}
     runs: dict = {}  # dtype -> "plain" / "vmap" -> states [len(steps)]
     for dtype in ["fp64", "fp32"]:
         torch.set_default_dtype(DTYPES[dtype])
-        magic = exp.magic(model)
         runs[dtype], res = {}, {"test_loss": {}, "peak_gpu_mb": {}}
         for name in ["plain", "vmap"]:
             if device.startswith("cuda"):
@@ -58,7 +56,7 @@ def vmap_error(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
             runs[dtype][name] = [s.apply(lambda t: t[0]) for s in states] if name == "vmap" else states
             res["peak_gpu_mb"][name] = torch.cuda.max_memory_allocated() / 2**20 if device.startswith("cuda") else float("nan")
             res["test_loss"][name] = [
-                eval_loss(model, exp.loss_fn, {k: p.to(device) for k, p in s.params.items()}, test_loader, bf16=exp.bf16)[0].item()
+                eval_loss(exp.model, exp.loss_fn, {k: p.to(device) for k, p in s.params.items()}, exp.test_loader, test_idx, bf16=exp.bf16)[0].item()
                 for s in runs[dtype][name]
             ]
             click.echo(f"{dtype} {name:5s} test loss {res['test_loss'][name][-1]:.6f}  peak GPU {res['peak_gpu_mb'][name]:.0f} MB")
