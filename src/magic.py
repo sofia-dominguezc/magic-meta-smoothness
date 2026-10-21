@@ -1,8 +1,7 @@
 import math
 from tqdm import tqdm
-from typing import Callable, Iterator
 from dataclasses import dataclass, replace
-from functools import partial
+from typing import Callable, Iterator
 
 import torch
 from torch import Tensor, nn
@@ -10,7 +9,7 @@ import torch.nn.functional as F
 import torch.autograd.forward_ad as fwAD
 from torch.func import grad_and_value, functional_call
 
-from src.data import EvalLoader, Loader
+from src.data import EvalLoader, Loader, Subset
 from src.logging import Logger, op_norm
 from src.eigvals import top_hessian_eigs
 from src.models import OptimState, dict_zip
@@ -24,44 +23,37 @@ def cross_entropy(out: Tensor, Y: Tensor) -> Tensor:
 
 
 def mse(out: Tensor, Y: Tensor) -> Tensor:
-    """Mean over the classes of the squared error to the one-hot labels."""
-    return (out - F.one_hot(Y, out.shape[1]).to(out.dtype)).pow(2).mean(1)
+    """Squared error to the one-hot labels"""
+    return 0.5 * (out - F.one_hot(Y, out.shape[1]).to(out.dtype)).pow(2).sum(-1)
 
 
 LOSSES: dict[str, LossFn] = {"ce": cross_entropy, "mse": mse}
 
 
 def metrics(out: Tensor, Y: Tensor) -> dict[str, Tensor]:
-    """Per-example classification metrics of the model output, for logging: accuracy and margin."""
+    """Per-example classification metrics of the model: accuracy and margin."""
     correct = out.gather(1, Y[:, None])[:, 0]
     best_other = out.scatter(1, Y[:, None], float("-inf")).max(1).values
     return {"acc": (out.argmax(1) == Y).to(out.dtype), "margin": correct - best_other}
 
 
-def model_call(
-    model: nn.Module, params: dict[str, Tensor], X: Tensor, *, dtype: torch.dtype | None = None
-) -> Tensor:
-    """`model(params, X)` computed in `dtype` (bfloat16 also uses autocast: e.g. softmax stays in float32)."""
-    if dtype is None:
-        return functional_call(model, params, (X,))
-    orig_dtype = next(iter(params.values())).dtype
-    with torch.autocast(X.device.type, torch.bfloat16, enabled=dtype == torch.bfloat16):
-        out: Tensor = functional_call(
-            model, {k: p.to(dtype) for k, p in params.items()}, (X.to(dtype),)
-        )
-    return out.to(orig_dtype)
+def model_call(model: nn.Module, params: dict[str, Tensor], X: Tensor, *, bf16: bool = False) -> Tensor:
+    """`model(params, X)`, with the matmuls in bfloat16 (autocast) if `bf16`"""
+    with torch.autocast(X.device.type, torch.bfloat16, enabled=bf16):
+        out: Tensor = functional_call(model, params, (X,))
+    return out.to(X.dtype)
 
 
 def eval_loss(
-    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor], loader: EvalLoader, grad: bool = False,
-    dtype: torch.dtype | None = None,
+    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor],
+    loader: EvalLoader, grad: bool = False, bf16: bool = False,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
-    """Mean loss over the examples of `loader`, accumulated batch by batch to bound the memory (`model_call` in `dtype`).
+    """Mean loss over the examples of `loader`, accumulated batch by batch to bound the memory.
     Returns: (loss, {metric: mean value}, {param: d loss / d param} if `grad` else {})."""
 
     def batch_loss(params: dict[str, Tensor], X: Tensor, Y: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """This batch's share of the mean loss, and of the mean metrics."""
-        out = model_call(model, params, X, dtype=dtype)
+        out = model_call(model, params, X, bf16=bf16)
         return (
             loss_fn(out, Y).sum() / len(loader),
             {k: v.sum() / len(loader) for k, v in metrics(out, Y).items()},
@@ -88,68 +80,75 @@ class Magic:
     - train: plain training, supports multiple data weightings
     - train_logged: one training with logs
     - backprop: MAGIC, compute the effect of weights df(s_T)/dw on model training
+    `bf16`: the model forward in bfloat16 (autocast)
     """
 
     model: nn.Module
     loader: Loader
     loss_fn: LossFn
-    logger: Logger | None = None
-    test_loader: EvalLoader | None = None
-    eval_every: int = 10
-    n_eigs: int = 1
-    log_tangent: bool = True
-    compute_dtype: torch.dtype | None = None
+    bf16: bool = False
     compile: bool = False
-    chunk_size: int | None = None
+
+    logger: Logger | None = None
+    n_top_eigs: int = 1
+    n_neg_eigs: int = 0
+    eig_every: int = 10
+    log_tangent: bool = True
+
+    test_loader: EvalLoader | None = None
+    eval_every: int = 100  # how often to eval
+    n_test: int | None = None  # how many samples to use for eval
 
     @property
     def device(self) -> torch.device | str | None:
         return self.loader.device
 
-    @partial(torch.func.grad, argnums=1)
-    def _grad(self, params: dict[str, Tensor], weights: Tensor, X: Tensor, Y: Tensor) -> Tensor:
-        """The training objective of one step with samples weighted by `weights`"""
-        out = model_call(self.model, params, X, dtype=self.compute_dtype)
-        return (weights * self.loss_fn(out, Y)).mean()
-
     def train(
         self, init_state: OptimState, *, n_steps: int, start: int = 0,
-        weights: Tensor | None = None, weights_from: int = 0, ckpt_every: int | None = None,
+        weights: Tensor | None = None, ckpt_every: int | None = None,
+        pbar: bool = True,
     ) -> tuple[OptimState, list[OptimState]]:
         """Train on steps [start, start + n_steps) with the per-example weights `weights`.
-        `weights` can be None (all ones) or (#n_weights, #datapoints).
+        `weights` can be None (all ones), (#datapoints), or (#n_weights, #datapoints)
+        `init_state` can be batched if `weights` are too
         Returns: (final state, states (start, start + ckpt_every, ...))
         """
+        @torch.func.grad
+        def grad_fn(params: dict[str, Tensor], weights: Tensor, X: Tensor, Y: Tensor) -> Tensor:
+            """The training objective of one step with samples weighted by `weights`"""
+            out = model_call(self.model, params, X, bf16=self.bf16)
+            return (weights * self.loss_fn(out, Y)).mean()
+
         state = init_state.apply(lambda t: t.to(self.device, non_blocking=True, copy=True))
         if weights is None:
-            weights = torch.ones(len(self.loader.dataset)).to(self.device, non_blocking=True)
-            grad_fn = self._grad
-        else:
-            weights = weights.to(self.device, non_blocking=True)
-            state = state.apply(lambda t: t.expand(len(weights), *t.shape).clone())
-            grad_fn = torch.func.vmap(
-                self._grad, in_dims=(0, 0, None, None), chunk_size=self.chunk_size
-            )
+            weights = torch.ones(len(self.loader.dataset))
+        weights = weights.to(self.device, non_blocking=True)
+        if weights.ndim == 2:
+            name, p = next(iter(state.params.items()))
+            if p.ndim == self.model.get_parameter(name).ndim:  # not already batched
+                state = state.apply(lambda t: t.expand(len(weights), *t.shape).clone())
+            grad_fn = torch.func.vmap(grad_fn, in_dims=(0, 0, None, None))
         if self.compile:
             grad_fn = torch.compile(grad_fn)
+
         ckpts: list[OptimState] = []
-        for t in range(start, start + n_steps):
+        for t in tqdm(range(start, start + n_steps), disable=not pbar, desc="train"):
             if ckpt_every and (t - start) % ckpt_every == 0:
                 ckpts.append(state.apply(lambda t: t.to("cpu", copy=True)))
             X, Y, idx = self.loader.get(t)
-            w = weights[..., idx] if t >= weights_from else torch.ones_like(weights[..., idx])
-            grads = grad_fn(state.params, w, X, Y)
-            state = state.step(grads)
+            grads = grad_fn(state.params, weights[..., idx], X, Y)
+            state = state.step(grads, t)
         return state.apply(lambda t: t.cpu()), ckpts
 
     def train_logged(self, init_state: OptimState, *, n_steps: int, start: int = 0) -> OptimState:
         """Train on all the data on steps [start, start + n_steps) while logging.
-        Logs the top few eigenvalues, the norm of ds_t/ds_0 on a random direction, and more.
+        Logs the top Hessian eigenvalues, the norm of ds_t/ds_0 on a random direction, and more.
         """
         assert self.logger is not None
+        self.logger.eos = init_state.stability_threshold
         state = init_state.apply(lambda t: t.to(self.device, copy=True))
 
-        eigvecs: Tensor | None = None
+        eigvecs: dict[int, Tensor] = {}  # sign (1: top, -1: most negative) -> LOBPCG warm start
         tangent: OptimState | None = None  # ds_t/ds_0 @ v
         if self.log_tangent:
             g = torch.Generator().manual_seed(start)
@@ -158,15 +157,18 @@ class Magic:
 
         for t in tqdm(range(start, start + n_steps)):
             X, Y, _ = self.loader.get(t)
+            if state.lr.kind != "constant" or state.lr.warmup:
+                self.logger.log(t, lr=torch.tensor(state.lr(t)))
             if tangent is not None:
                 fwAD.enter_dual_level()
                 state = state.unflatten([fwAD.make_dual(s, d) for s, d in zip(state, tangent)])
             params = {name: p.requires_grad_() for name, p in state.params.items()}
+            log_eigs = self.n_top_eigs + self.n_neg_eigs > 0 and (t - start) % self.eig_every == 0
 
-            out = model_call(self.model, params, X, dtype=self.compute_dtype)
+            out = model_call(self.model, params, X, bf16=self.bf16)
             loss = self.loss_fn(out, Y).mean()
-            grads = torch.autograd.grad(loss, params, create_graph=self.n_eigs > 0)
-            state = state.step(grads)
+            grads = torch.autograd.grad(loss, params, create_graph=log_eigs)
+            state = state.step(grads, t)
 
             if tangent is not None:
                 tangent = state.apply(lambda s: fwAD.unpack_dual(s).tangent.detach())
@@ -179,25 +181,42 @@ class Magic:
             self.logger.log_norms(t, "grads", grads)
             if tangent is not None:
                 self.logger.log_norms(t, "tangent", tangent)
-            if self.n_eigs > 0 and t % 10 == 0:
-                eigvals, eigvecs, n_iter = top_hessian_eigs(
-                    grads, params, self.n_eigs, eigvecs, precond=state.precond, seed=start
-                )
-                eigvals = eigvals * (2 / state.stability_threshold)
-                self.logger.log(
-                    t, **{f"eig/{i + 1}": v for i, v in enumerate(eigvals.unbind())},
-                    lobpcg_iters=torch.tensor(n_iter),
-                )
-            if tangent is not None and eigvecs is not None:
+            if log_eigs:
+                sizes = [p.numel() for p in params.values()]
+                for sign, k in ((1, self.n_top_eigs), (-1, self.n_neg_eigs)):
+                    if k == 0:
+                        continue
+                    eigvals, eigvecs[sign], n_iter = top_hessian_eigs(
+                        grads, params, k, eigvecs.get(sign),
+                        precond=state.precond(t), seed=start, negative=sign < 0,
+                    )
+                    self.logger.log(
+                        t, **{f"eig/{sign * (i + 1)}": lam for i, lam in enumerate(eigvals.unbind())},
+                        **{f"lobpcg_iters/{sign}": torch.tensor(n_iter)},
+                    )
+                    for i, vec in enumerate(eigvecs[sign].unbind(dim=1)):
+                        vec_dict = {
+                            name: v.view_as(p) for v, (name, p) in zip(vec.split(sizes), params.items())
+                        }
+                        self.logger.log_norms(t, f"eigval/{sign * (i + 1)}", vec_dict)
+            if tangent is not None and eigvecs:
                 flat_tangent = torch.cat([t.flatten() for t in tangent.params.values()])
-                dot_prod = torch.dot(flat_tangent, eigvecs[:, 0]) / flat_tangent.norm()
-                self.logger.log(t, tangent_top_eig=dot_prod)
+                if 1 in eigvecs:
+                    dot_prod = torch.dot(flat_tangent, eigvecs[1][:, 0]) / flat_tangent.norm()
+                    self.logger.log(t, tangent_top_eig=dot_prod)
+                if -1 in eigvecs:
+                    dot_prod = torch.dot(flat_tangent, eigvecs[-1][:, 0]) / flat_tangent.norm()
+                    self.logger.log(t, tangent_neg_eig=dot_prod)
             if self.test_loader is not None and (
                 (t - start + 1) % self.eval_every == 0 or t - start == n_steps - 1
             ):
+                loader = self.test_loader
+                if self.n_test is not None and t - start < n_steps - 1:  # random subset
+                    loader = replace(
+                        loader, indices=Subset(n=self.n_test, index=t).indices(loader.dataset)
+                    )
                 val_loss, val_metrics, _ = eval_loss(
-                    self.model, self.loss_fn, state.params,
-                    self.test_loader, dtype=self.compute_dtype,
+                    self.model, self.loss_fn, state.params, loader, bf16=self.bf16,
                 )
                 self.logger.log(
                     t, test_loss=val_loss, **{f"test_{k}": v for k, v in val_metrics.items()}
@@ -206,25 +225,24 @@ class Magic:
 
         return state.apply(lambda t: t.cpu())
 
-    def rewind(
-        self, init_state: OptimState, *, n_steps: int, start: int = 0, passes: int = 2
+    def replay(
+        self, init_state: OptimState, *, n_steps: int, start: int = 0, passes: int = 2, pbar: bool = True
     ) -> Iterator[OptimState]:
-        """Reconstruct the states [start, start + n_steps] in reverse order.
+        """Reconstruct the states [start, start + n_steps] in reverse order
         Cost: `passes` trainings. Memory: `passes * n_steps^(1/passes)` states.
         """
-        chunk = math.ceil(n_steps ** ((passes - 1) / passes))  # 1 if passes == 1
-        final, ckpts = self.train(init_state, n_steps=n_steps, start=start, ckpt_every=chunk)
-        yield final
-        if passes == 1:
-            yield from reversed(ckpts)
+        if n_steps == 0:
+            yield init_state
             return
+        chunk = math.ceil(n_steps ** ((passes - 1) / passes))
+        final, ckpts = self.train(init_state, n_steps=n_steps, start=start, ckpt_every=chunk, pbar=pbar)
+        yield final
         for i, ckpt in reversed(list(enumerate(ckpts))):
-            t0 = start + i * chunk
-            inner = self.rewind(
-                ckpt, n_steps=min(chunk, start + n_steps - t0), start=t0, passes=passes - 1
+            r_start = start + i * chunk
+            r_steps = min(chunk, start + n_steps - r_start)
+            yield from self.replay(
+                ckpt, n_steps=r_steps - 1, start=r_start, passes=passes - 1, pbar=False
             )
-            next(inner)  # its final state, already yielded
-            yield from inner
 
     def backprop(
         self, init_state: OptimState, *, n_steps: int, start: int = 0,
@@ -234,32 +252,13 @@ class Magic:
         through the training steps [start, start + n_steps) from `init_state`.
 
         Returns: ({name: f(s_T)}, {name: df(s_T)/dw}).
-        Cost: `1 + passes + #fns` trainings; memory: `passes * n_steps^(1/passes) + #fns` states.
+        Cost: `passes + 1` trainings + one backward through training.
+        Memory: `passes * n_steps^(1/passes) + #fns` states.
         """
         if (n_fns := len(eval_loaders)) == 0:
             return {}, {}
-        states = self.rewind(init_state, n_steps=n_steps, start=start, passes=passes)
+        states = self.replay(init_state, n_steps=n_steps, start=start, passes=passes)
         final_state = next(states).apply(lambda t: t.to(self.device))  # 1x training
-
-        def backprop_step(
-            state: OptimState, X: Tensor, Y: Tensor, delta: dict[str, dict[str, Tensor]]
-        ) -> tuple[dict[str, dict[str, Tensor]], Tensor]:
-            """(df/ds_t, df/dw_t) = ds_{t+1} / d(s_t, w_t) @ df/ds_{t+1} for all `f`.
-            Cost: `1 + #fns` trainings
-            """
-
-            def step_fn(
-                param_groups: dict[str, dict[str, Tensor]], weights: Tensor
-            ) -> dict[str, dict[str, Tensor]]:
-                s = replace(state, **param_groups)
-                return s.step(self._grad(s.params, weights, X, Y)).param_groups
-
-            weights = torch.ones(len(Y), dtype=X.dtype, device=X.device)
-            _, vjp_fn = torch.func.vjp(step_fn, state.param_groups, weights)
-            return torch.func.vmap(vjp_fn, chunk_size=self.chunk_size)(delta)
-
-        if self.compile:  # NOTE: it may break on Adam because of `t`
-            backprop_step = torch.compile(backprop_step)
 
         outputs: dict[str, Tensor] = {}  # f(s_T)
         betas: dict[str, Tensor] = {}    # df/dw
@@ -267,19 +266,28 @@ class Magic:
         for i, (name, eval_loader) in enumerate(eval_loaders.items()):
             f_value, _, f_grad = eval_loss(
                 self.model, self.loss_fn, final_state.params,
-                eval_loader, grad=True, dtype=self.compute_dtype,
+                eval_loader, grad=True, bf16=self.bf16,
             )
             outputs[name] = f_value
             betas[name] = torch.zeros(len(self.loader.dataset), device=self.device)
-            for t, g in dict_zip(delta.params, f_grad).values():
-                t[i] = g
+            for d, g in dict_zip(delta.params, f_grad).values():
+                d[i] = g
 
         steps = reversed(range(start, start + n_steps))
-        for t, state in zip(steps, tqdm(states, total=n_steps)):  # `passes - 1` trainings
+        for t, state in zip(steps, tqdm(states, total=n_steps, desc="magic")):
             X, Y, indices = self.loader.get(t)
-            state = state.apply(lambda t: t.to(self.device, non_blocking=True))
-            d_state, d_weights = backprop_step(state, X, Y, delta.param_groups)
-            delta = replace(delta, **d_state)
+            state = state.apply(lambda t: t.to(self.device, non_blocking=True).requires_grad_())
+            weights = torch.ones_like(indices, dtype=X.dtype).requires_grad_()
+
+            out = model_call(self.model, state.params, X, bf16=self.bf16)
+            loss = (weights * self.loss_fn(out, Y)).mean()
+            grads = torch.autograd.grad(loss, state.params, create_graph=True)
+            new_state = state.step(grads, t)
+
+            *d_state, d_weights = torch.autograd.grad(
+                list(new_state), [*state, weights], list(delta), is_grads_batched=True
+            )
+            delta = delta.unflatten(d_state)
             for i, name in enumerate(eval_loaders):
                 betas[name].index_add_(0, indices, d_weights[i])
                 if self.logger is not None:

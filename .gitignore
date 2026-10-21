@@ -2,8 +2,7 @@ data/
 __pycache__/
 images/
 .pytest_cache/
-experiments/
-test/
 results/
 wandb/
 NOTES.md
+CLAUDE.md

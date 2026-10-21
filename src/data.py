@@ -34,11 +34,13 @@ class Images(Dataset):
         self.X = (X[:, None] if X.ndim == 3 else X.permute(0, 3, 1, 2)).contiguous()
         self.labels = torch.as_tensor(data.targets, dtype=torch.long)
         mean, std = self.stats[name]
-        self.mean, self.std = torch.tensor(mean)[:, None, None], torch.tensor(std)[:, None, None]
+        self.mean, self.std = torch.tensor(mean, dtype=torch.float64)[:, None, None], torch.tensor(std, dtype=torch.float64)[:, None, None]
         self.in_shape, self.out_dim = tuple(self.X.shape[1:]), 10
 
     def get_batch(self, idx: Tensor) -> tuple[Tensor, Tensor]:
-        X = (self.X[idx].to(torch.get_default_dtype()) / 255 - self.mean) / self.std
+        """In the default dtype at call time (not at construction)."""
+        dtype = torch.get_default_dtype()
+        X = (self.X[idx].to(dtype) / 255 - self.mean.to(dtype)) / self.std.to(dtype)
         return X, self.labels[idx]
 
 
@@ -52,14 +54,16 @@ class Majority(Dataset):
         self.labels = torch.stack([self.example(i)[1] for i in range(size)])
 
     def example(self, i: int) -> tuple[Tensor, Tensor]:
+        """Generated in float64 (the float32 and float64 samplers draw different numbers from the same seed, and the
+        labels must match the inputs whatever the default dtype)."""
         g = torch.Generator().manual_seed((self.seed << 32) + i)
-        x = torch.randn(self.dim, generator=g)
-        flip = torch.randn((), generator=g) > 2
+        x = torch.randn(self.dim, generator=g, dtype=torch.float64)
+        flip = torch.randn((), generator=g, dtype=torch.float64) > 2
         return x, torch.tensor(int((x.sum() > 0) != flip))
 
     def get_batch(self, idx: Tensor) -> tuple[Tensor, Tensor]:
         X, Y = zip(*(self.example(i) for i in idx.tolist()))
-        return torch.stack(X), torch.stack(Y)
+        return torch.stack(X).to(torch.get_default_dtype()), torch.stack(Y)
 
 
 DATASETS = {"mnist": partial(Images, "MNIST"), "cifar10": partial(Images, "CIFAR10"), "majority": Majority}
@@ -110,62 +114,54 @@ class EvalLoader:
 
 @dataclass(frozen=True, kw_only=True)
 class Subset:
-    """The `index`-th random subset of `frac` * (dataset size) examples, all of class `label`
-    (or of any class if None). Training runs drop it (weight 0), and evaluation functions are
-    the mean loss over it.
-    """
+    """The `index`-th random subset of `n` examples of a dataset: an eval function is the mean loss over one (of the
+    test set), a "drop" perturbation zeroes the training weights on one."""
 
-    frac: float
-    label: int | None = None
+    n: int
     index: int = 0
 
-    def mask(self, data: Dataset) -> Tensor:
-        """Boolean mask [N] (on CPU), True on the selected examples."""
-        idx = torch.arange(len(data)) if self.label is None else (data.labels == self.label).nonzero()[:, 0]
-        n = round(self.frac * len(data))
-        if n > len(idx):
-            raise ValueError(f"{self.frac:.0%} of the {len(data)} examples is {n}, but label {self.label} has only {len(idx)}")
-        perm = torch.randperm(len(idx), generator=torch.Generator().manual_seed(self.index))
-        mask = torch.zeros(len(data), dtype=torch.bool)
-        mask[idx[perm[:n]]] = True
-        return mask
+    def indices(self, data: Dataset) -> Tensor:
+        """The selected examples [n], sorted (on CPU)."""
+        if self.n > len(data):
+            raise ValueError(f"{self.n} examples asked of {len(data)}")
+        perm = torch.randperm(len(data), generator=torch.Generator().manual_seed(self.index))
+        return perm[: self.n].sort().values
 
     @property
     def name(self) -> str:
-        return f"{self.frac:.1%} of " + ("all labels" if self.label is None else f"label {self.label}") + f" #{self.index}"
+        return f"{self.n} examples #{self.index}"
 
     @property
     def dirname(self) -> str:
-        return self.name.replace("% of ", "pct_").replace(" ", "_").replace("#", "")
+        return f"{self.n}_examples_{self.index}"
 
 
 @dataclass(frozen=True, kw_only=True)
 class Perturbation:
     """The `index`-th random change of the per-example training weights w (1 = unchanged):
-    - kind "drop": w = 0 on a random `alpha` fraction of the examples (of class `label` if given, see `Subset`)
+    - kind "drop": w = 0 on a random `alpha` fraction of the examples (a `Subset`)
     - kind "randn": w = 1 + N(0, alpha) (variance alpha) on every example: continuous in alpha, and
       ||w - 1||^2 = alpha * N like a drop of a fraction alpha
     """
 
     kind: str = "drop"
     alpha: float
-    label: int | None = None
     index: int = 0
 
     def weights(self, data: Dataset) -> Tensor:
         """The weights [N] (on CPU)."""
         if self.kind == "drop":
-            return (~Subset(frac=self.alpha, label=self.label, index=self.index).mask(data)).to(torch.get_default_dtype())
-        assert self.kind == "randn" and self.label is None, self
+            w = torch.ones(len(data))
+            w[Subset(n=round(self.alpha * len(data)), index=self.index).indices(data)] = 0
+            return w
+        assert self.kind == "randn", self.kind
         return 1 + self.alpha**0.5 * torch.randn(len(data), generator=torch.Generator().manual_seed(self.index))
 
     @property
-    def group(self) -> str:
+    def name(self) -> str:
         """What the perturbation does, without the index (e.g. to color points)."""
-        if self.kind == "randn":
-            return f"randn {self.alpha:g}"
-        return f"drop {self.alpha:.1%} of " + ("all labels" if self.label is None else f"label {self.label}")
+        return f"{self.kind} {self.alpha:g}"
 
     @property
     def dirname(self) -> str:
-        return self.group.replace(" of ", "_").replace(" ", "_").replace("%", "pct") + f"_{self.index}"
+        return f"{self.kind}_{self.alpha:g}_{self.index}"

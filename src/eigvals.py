@@ -1,5 +1,5 @@
 import torch
-from typing import Callable
+from typing import Callable, Mapping
 
 """Native PyTorch implementation of the LOBPCG algorithm for eigenvalue computation.
 
@@ -20,7 +20,7 @@ def torch_lobpcg(
         how the function learns what k is.
       max_iter (int): the maximum number of LOBPCG iterations to run
       rtol (float): column i has converged when its residual ||A x_i - theta_i x_i|| is below
-        rtol * max_j |theta_j|, so each theta_i is within that of a true eigenvalue
+        rtol * (||A x_i|| + theta_i), so each theta_i is within about that of a true eigenvalue
 
     Returns:
       top eigenvalues [k]
@@ -61,7 +61,8 @@ def torch_lobpcg(
         AX = A(X)
         R = AX - theta[None, :] * X
         resid_norms = torch.linalg.norm(R, ord=2, dim=0)
-        res_converged = resid_norms < rtol * (torch.linalg.norm(AX, ord=2, dim=0) + theta)
+        # |theta| (JAX: theta): on an indefinite operator a negative Ritz value would make the bound ~0
+        res_converged = resid_norms < rtol * (torch.linalg.norm(AX, ord=2, dim=0) + theta.abs())
         converged = torch.sum(res_converged)
     return theta, X, n_iter
 
@@ -89,11 +90,8 @@ def _orthonormalize(basis):
 
 
 def _eigh_ascending(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    try:
-        w, V = torch.linalg.eigh(A)
-    except:
-        print("uh oh")
-        raise Exception("eigh failed")
+    """(Despite the name, kept from JAX) eigenvalues in descending order."""
+    w, V = torch.linalg.eigh(A)
     idx = torch.argsort(-w)
     return w[idx], V[:, idx]
 
@@ -136,31 +134,37 @@ def _extend_basis(X, m):
 
 def top_hessian_eigs(
     grads: dict[str, torch.Tensor], params: dict[str, torch.Tensor], k: int,
-    eigvecs: torch.Tensor | None = None, precond: dict[str, torch.Tensor] | None = None, seed: int = 0,
+    eigvecs: torch.Tensor | None = None, precond: Mapping[str, torch.Tensor | float] | None = None, seed: int = 0,
+    negative: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Top k eigenvalues of the Hessian H (w.r.t. `params`) of the loss whose gradient is `grads`
     (computed with create_graph=True), by LOBPCG.
     Args:
     - eigvecs: [#params, k] to warm-start LOBPCG (None: random with `seed`)
-    - precond: per-element multiplier P of the gradient in the optimizer step (None: 1): then the eigenvalues
-      are those of sqrt(P) H sqrt(P), which govern the stability of the step
+    - precond: per-element step size P (`OptimState.precond`; None: 1), each broadcastable to its param: then the
+      eigenvalues are those of sqrt(P) H sqrt(P), which govern the stability of the step
+    - negative: the k most negative eigenvalues instead (LOBPCG on -H), most negative first
     Returns: (eigenvalues [k], eigenvectors [#params, k] to warm-start the next call, LOBPCG iterations).
     """
-    sizes = [p.numel() for p in params.values()]
-    sqrt_p = None if precond is None else torch.cat([p.flatten() for p in precond.values()]).sqrt()[:, None]
+    sizes, sqrt_p, sign = [p.numel() for p in params.values()], None, -1.0 if negative else 1.0
+    if precond is not None:
+        sqrt_p = torch.cat([
+            torch.as_tensor(m, dtype=p.dtype, device=p.device).expand_as(p).flatten()
+            for m, p in zip(precond.values(), params.values())
+        ]).sqrt()[:, None]
 
-    def hvp(V: torch.Tensor) -> torch.Tensor:  # [#params, k] -> [#params, k]
+    def hvp(V: torch.Tensor) -> torch.Tensor:  # [#params, m] -> [#params, m] (LOBPCG uses m = k and 3k)
         if sqrt_p is not None:
             V = sqrt_p * V
-        cols = []
-        for v in V.unbind(1):
-            vs = [c.view_as(p) for c, p in zip(v.split(sizes), params.values())]
-            hv = torch.autograd.grad(list(grads.values()), params, vs, retain_graph=True)
-            cols.append(torch.cat([h.flatten() for h in hv.values()]))
-        HV = torch.stack(cols, 1)
-        return HV if sqrt_p is None else sqrt_p * HV
+        V_list = [v.T.reshape(-1, *p.shape) for v, p in zip(V.split(sizes), params.values())]
+        HV_dict = torch.autograd.grad(
+            list(grads.values()), params, V_list, retain_graph=True, is_grads_batched=True
+        )
+        HV = torch.cat([hv.reshape(len(hv), -1) for hv in HV_dict.values()], dim=1).T
+        return sign * (HV if sqrt_p is None else sqrt_p * HV)
 
     if eigvecs is None:
         g = torch.Generator().manual_seed(seed)
         eigvecs = torch.randn(sum(sizes), k, generator=g).to(next(iter(params.values())))
-    return torch_lobpcg(hvp, eigvecs)
+    eigvals, eigvecs, n_iter = torch_lobpcg(hvp, eigvecs)
+    return sign * eigvals, eigvecs, n_iter

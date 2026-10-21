@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+EMA_HALF_LIFE = 10  # steps, for the smoothing of the scalar plots (whatever the logging interval)
+
 
 def op_norm(t: Tensor, u: Tensor | None = None, n_iter: int = 3) -> tuple[Tensor, Tensor | None]:
     """Operator norm of a parameter-shaped tensor, without syncs:
@@ -14,21 +16,19 @@ def op_norm(t: Tensor, u: Tensor | None = None, n_iter: int = 3) -> tuple[Tensor
     - [out, in, ...] tensors, as [out, -1] matrices: the spectral norm, by `n_iter` power iterations
       (2 matrix-vector products each) from `u` ([out]; random if None)
     Returns: (norm, u), with `u` to warm-start the next call. The norm is a lower bound that converges over calls
-    (for a Gaussian matrix, within ~10% after the first call).
-
-    In the spectral μP of `models.py` this is the norm in which every raw parameter and gradient is O(1) in every
-    layer (for the effective weight W = sqrt(fan_out / fan_in) w it is the RMS-to-RMS operator norm, i.e. how much
-    the layer's output RMS changes per unit input RMS), and a step changes each parameter by O(lr)."""
+    (for a Gaussian matrix, within ~10% after the first call). It is the norm in which the raw tensors of `models.py`
+    are O(1)."""
     t = t.detach()
     if t.ndim <= 1:
         return t.norm(), None
     M = t.flatten(1)
-    if u is None:
-        u = torch.randn(M.shape[0], generator=torch.Generator().manual_seed(0)).to(M)
+    r = torch.randn(M.shape[0], generator=torch.Generator().manual_seed(0)).to(M)
+    u = r if u is None else torch.where(u.norm() > 0, u, r)  # a zero `u` (from a zero tensor) would stay zero
+    eps = torch.finfo(M.dtype).tiny  # F.normalize's default 1e-12 breaks the iteration on tensors of norm < 1e-12
     for _ in range(n_iter):
-        v = F.normalize(M.T @ u, dim=0)
+        v = F.normalize(M.T @ u, dim=0, eps=eps)
         Mv = M @ v
-        u = F.normalize(Mv, dim=0)
+        u = F.normalize(Mv, dim=0, eps=eps)
     return Mv.norm(), u
 
 
@@ -38,12 +38,14 @@ class Logger:
     - metric names are "panel" or "panel/line": `finish` plots one panel per panel name, one line per line name
     - `log_norms` logs the `op_norm`, with 10 power iterations the first time a tensor is seen and 3 (warm-started)
       afterwards
-    - the "eig" panel is for the normalized top Hessian eigenvalues: the edge of stability is drawn at 2
+    - the "eig" panel is for the Hessian eigenvalues (top "eig/1", ...; most negative "eig/-1", ...; of the
+      preconditioned Hessian, so the lr is absorbed): the stability threshold `eos` is drawn, if set
     """
 
     def __init__(self, name: str = "logging run", *, flush_every: int = 100):
         self.name = name
         self.flush_every = flush_every
+        self.eos: float | None = None  # `OptimState.stability_threshold`, drawn in the "eig" panel
         self._buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)
         self._history: dict[str, list[tuple[list[int], Tensor]]] = defaultdict(list)  # (steps, values) per flush
         self._running_eigs: dict[str, Tensor | None] = {}
@@ -59,7 +61,7 @@ class Logger:
     def log_norms(self, step: int, name: str, tensors):
         """Log the `op_norm` of each tensor of a dict {tensor name: tensor} as "name/<tensor name>",
         or of an OptimState as "name/<group>/<tensor name>"."""
-        groups: dict[str, dict[str, Tensor]] = {"": tensors} if isinstance(tensors, dict) else tensors.param_groups
+        groups = {"": tensors} if isinstance(tensors, dict) else {g: getattr(tensors, g) for g in tensors.groups}
         for group, group_tensors in groups.items():
             panel = f"{name}/{group}" if group else name
             self._norm_panels.add(panel)
@@ -82,8 +84,8 @@ class Logger:
 
     def finish(self, path: Path):
         """Save the logged metrics to `path` as {name: {"step": [n], "value": [n]}} and plot them next to it:
-        - <path>.png: the scalars, one panel per panel name (smoothed if logged every step)
-        - <path>_norms.png: the norms, one panel per `log_norms` name, one line per tensor, log scale
+        - <path>.png: the scalars, one panel per panel name (EMA-smoothed in step time when there are enough points)
+        - <path>_norms.png: the norms, one panel per `log_norms` name, one line per tensor
         """
         self.flush()
         metrics = {
@@ -112,28 +114,29 @@ class Logger:
 
     def _plot_scalars(self, metrics: dict, panels: dict[str, list[str]], out_path: Path):
         fig, axes = self._grid(len(panels), ncols=4, size=(4.5, 3.4))
-        alpha = 1 - 2 ** (-1 / 10)  # EMA with a half-life of 10 steps
         for ax, (panel, names) in zip(axes, panels.items()):
             for i, name in enumerate(names):
                 steps, arr = metrics[name]["step"].numpy(), metrics[name]["value"].numpy()
                 label = name.rsplit("/", 1)[1] if "/" in name else None
-                if len(steps) > 50:  # per-step metric: smooth it
+                style = "o-" if len(steps) > 1 and steps[1] - steps[0] > 1 else "-"  # not per-step: show the points
+                if len(steps) >= 20 and panel != "lr":  # enough points: smooth (not the schedule)
+                    decay = 2.0 ** (-np.diff(steps) / EMA_HALF_LIFE)  # EMA in step time: the past decays by 2^(-gap / half-life)
                     ema = arr.astype(np.float64)  # (copies; ints would truncate the average)
                     for j in range(1, len(ema)):
-                        ema[j] = alpha * arr[j] + (1 - alpha) * ema[j - 1]
-                    ax.plot(steps, arr, alpha=0.3, lw=0.8, color=f"C{i}")
+                        ema[j] = decay[j - 1] * ema[j - 1] + (1 - decay[j - 1]) * arr[j]
+                    ax.plot(steps, arr, style, alpha=0.3, lw=0.8, ms=2, color=f"C{i}")
                     ax.plot(steps, ema, lw=1.2, color=f"C{i}", label=label)
                 else:
-                    ax.plot(steps, arr, "o-", ms=3, lw=1, color=f"C{i}", label=label)
-            if panel == "eig":
-                ax.axhline(2, color="gray", ls="--", lw=0.8, label="edge of stability")
+                    ax.plot(steps, arr, style, ms=3, lw=1, color=f"C{i}", label=label)
+            if panel == "eig" and self.eos is not None:
+                ax.axhline(self.eos, color="gray", ls=":", lw=1, label=f"stability threshold {self.eos:g}")
             if len(names) > 1 or panel == "eig":
                 ax.legend(fontsize=7)
             ax.set(title=panel, xlabel="step")
             ax.title.set_fontsize(9)
         fig.savefig(out_path, dpi=150)
 
-    def _plot_norms(self, metrics: dict, panels: dict[str, list[str]], out_path: Path):
+    def _plot_norms(self, metrics: dict, panels: dict[str, list[str]], out_path: Path, yscale='log'):
         """Lines colored by layer (the tensor name without its last component) and styled by that component."""
         tensors = list(dict.fromkeys(n.rsplit("/", 1)[1] for names in panels.values() for n in names))
         layers = list(dict.fromkeys(t.rpartition(".")[0] or t for t in tensors))
@@ -146,7 +149,7 @@ class Logger:
                 layer, _, kind = tensor.rpartition(".")
                 ax.plot(metrics[name]["step"].numpy(), metrics[name]["value"].numpy(), styles.get(kind, ":"),
                         lw=1, color=colors[layer or kind], label=tensor)
-            ax.set(title=panel, xlabel="step", yscale="log")
+            ax.set(title=panel, xlabel="step", **({"yscale": yscale} if yscale is not None else {}))
             ax.title.set_fontsize(9)
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="outside right center", fontsize=6, frameon=False)
