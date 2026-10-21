@@ -184,6 +184,9 @@ class Magic:
                 log.log_eigs(t, lambda v: vjp_fn(v)[0], state)
             if log.eval_every and ((t - start + 1) % log.eval_every == 0 or t - start == n_steps - 1):
                 log.log_eval(t, state.params, self.model, self.loss_fn, bf16=self.bf16, last=t - start == n_steps - 1)
+            if X.is_cuda:
+                log.logger.log(t, gpu_gb=torch.tensor(torch.cuda.max_memory_allocated() / 2**30))
+                torch.cuda.reset_peak_memory_stats()
         return state.apply(lambda t: t.cpu())
 
     def replay[T: OptimState](
