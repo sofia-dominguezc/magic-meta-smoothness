@@ -120,7 +120,7 @@ class ViT(nn.Module):
     """Pre-norm ViT with `patch` x `patch` patches, learned positional embeddings (a bias-like raw tensor:
     N(0, 1/dim), used as sqrt(dim) * pos), heads of `head_dim` dims, mean pooling and a linear readout."""
 
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, dim: int = 192, depth: int = 4, head_dim: int = 32, patch: int = 4):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, dim: int = 96, depth: int = 3, head_dim: int = 32, patch: int = 4):
         super().__init__()
         C, H, W = in_shape
         self.patch = patch
@@ -184,23 +184,12 @@ class OptimState:
         if isinstance(self.lr, dict):  # saved by `asdict`
             self.lr = LRSchedule(**self.lr)
 
-    def __getitem__(self, group: str) -> dict[str, Tensor]:
-        assert group in self.groups
-        return getattr(self, group)
-
     def __iter__(self) -> Iterator[Tensor]:
-        return (t for group in self.groups for t in self[group].values())
-
-    def update(self, fn: Callable[[Tensor], Tensor]):
-        """Replace each tensor by `fn(tensor)`, in place"""
-        for group in self.groups:
-            setattr(self, group, {k: fn(t) for k, t in self[group].items()})
+        return (t for group in self.groups for t in getattr(self, group).values())
 
     def apply(self, fn: Callable[[Tensor], Tensor]) -> Self:
         """A copy of the state with each tensor replaced by `fn(tensor)`"""
-        new = replace(self)
-        new.update(fn)
-        return new
+        return replace(self, **{group: {k: fn(t) for k, t in getattr(self, group).items()} for group in self.groups})
 
     def unflatten(self, tensors: Iterable[Tensor]) -> Self:
         """Inverse of iterating: a state like this one holding `tensors` instead"""
@@ -208,7 +197,7 @@ class OptimState:
         return self.apply(lambda _: next(it))
 
     def step(self, t: int, grads: dict[str, Tensor]) -> Self:
-        """Update the state tensors by step `t`, in place (the entries are replaced, not the tensors). Returns self."""
+        """The state after step `t` with the gradients `grads`"""
         raise NotImplementedError
 
     def precond(self, t: int) -> Mapping[str, Tensor | float]:
@@ -225,11 +214,10 @@ class OptimState:
 class SGDState(OptimState):
     def step(self, t: int, grads: dict[str, Tensor]) -> Self:
         P = self.precond(t)
-        self.params = {
+        return replace(self, params={
             k: p - P[k] * (g + self.weight_decay * p)
             for k, (p, g) in dict_zip(self.params, grads).items()
-        }
-        return self
+        })
 
     @property
     def stability_threshold(self) -> float:
@@ -250,15 +238,12 @@ class SGDMomentumState(SGDState):
     def step(self, t: int, grads: dict[str, Tensor]) -> Self:
         assert self.buffer is not None
         P = self.precond(t)
-        self.buffer = {
+        buffer = {
             k: self.momentum * buf + g + self.weight_decay * p
             for k, (p, buf, g) in dict_zip(self.params, self.buffer, grads).items()
         }
-        self.params = {
-            k: p - P[k] * buf
-            for k, (p, buf) in dict_zip(self.params, self.buffer).items()
-        }
-        return self
+        params = {k: p - P[k] * buf for k, (p, buf) in dict_zip(self.params, buffer).items()}
+        return replace(self, params=params, buffer=buffer)
 
     @property
     def stability_threshold(self) -> float:
@@ -303,9 +288,8 @@ class AdamState(OptimState):
         new_m = {k: b1 * m + (1 - b1) * g for k, (m, g) in dict_zip(self.m, grads).items()}
         new_v = {k: b2 * v + (1 - b2) * g * g for k, (v, g) in dict_zip(self.v, grads).items()}
         sizes = self._step_sizes(new_v, t)
-        self.params = {k: p - size * m for k, (p, m, size) in dict_zip(self.params, new_m, sizes).items()}
-        self.m, self.v = new_m, new_v
-        return self
+        params = {k: p - size * m for k, (p, m, size) in dict_zip(self.params, new_m, sizes).items()}
+        return replace(self, params=params, m=new_m, v=new_v)
 
     def precond(self, t: int) -> dict[str, Tensor]:
         """With this state's v (exact on the state after step t)."""

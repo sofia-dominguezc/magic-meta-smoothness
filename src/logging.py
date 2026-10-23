@@ -35,16 +35,18 @@ def op_norm(t: Tensor, u: Tensor | None = None, n_iter: int = 3) -> tuple[Tensor
 class Logger:
     """Accumulates per-step scalars on the device and only moves them to the CPU every `flush_every` values,
     so training never syncs.
-    - metric names are "panel" or "panel/line": `finish` plots one panel per panel name, one line per line name
+    - metric names are "panel" or "panel/line": `finish` plots one panel per panel name, one line per line name;
+      the line "ema" (the metric computed with an EMA of the params) is drawn dotted gray
     - `log_norms` logs the `op_norm`, with 10 power iterations the first time a tensor is seen and 3 (warm-started)
       afterwards
     - the "eig" panel is for the Hessian eigenvalues (top "eig/1", ...; most negative "eig/-1", ...; of the
       preconditioned Hessian, so the lr is absorbed): the stability threshold `eos` is drawn, if set
     """
 
-    def __init__(self, name: str = "logging run", *, flush_every: int = 100):
+    def __init__(self, name: str = "logging run", *, flush_every: int = 100, smooth: bool = True):
         self.name = name
         self.flush_every = flush_every
+        self.smooth = smooth  # EMA-smooth the scalar plots (when there are enough points)
         self.eos: float | None = None  # `OptimState.stability_threshold`, drawn in the "eig" panel
         self._buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)
         self._history: dict[str, list[tuple[list[int], Tensor]]] = defaultdict(list)  # (steps, values) per flush
@@ -115,19 +117,26 @@ class Logger:
     def _plot_scalars(self, metrics: dict, panels: dict[str, list[str]], out_path: Path):
         fig, axes = self._grid(len(panels), ncols=4, size=(4.5, 3.4))
         for ax, (panel, names) in zip(axes, panels.items()):
-            for i, name in enumerate(names):
+            i = 0  # color index of the next line
+            for name in names:
                 steps, arr = metrics[name]["step"].numpy(), metrics[name]["value"].numpy()
+                order = np.argsort(steps, kind="stable")  # (MAGIC logs the steps in reverse)
+                steps, arr = steps[order], arr[order]
                 label = name.rsplit("/", 1)[1] if "/" in name else None
-                style = "o-" if len(steps) > 1 and steps[1] - steps[0] > 1 else "-"  # not per-step: show the points
-                if len(steps) >= 20 and panel != "lr":  # enough points: smooth (not the schedule)
-                    decay = 2.0 ** (-np.diff(steps) / EMA_HALF_LIFE)  # EMA in step time: the past decays by 2^(-gap / half-life)
-                    ema = arr.astype(np.float64)  # (copies; ints would truncate the average)
-                    for j in range(1, len(ema)):
-                        ema[j] = decay[j - 1] * ema[j - 1] + (1 - decay[j - 1]) * arr[j]
-                    ax.plot(steps, arr, style, alpha=0.3, lw=0.8, ms=2, color=f"C{i}")
-                    ax.plot(steps, ema, lw=1.2, color=f"C{i}", label=label)
+                if label == "ema":  # computed with the EMA of the params: dotted gray
+                    color, ls, label = "0.45", ":", "ema of params"
                 else:
-                    ax.plot(steps, arr, style, ms=3, lw=1, color=f"C{i}", label=label)
+                    color, ls, i = f"C{i}", "-", i + 1
+                style = f"o{ls}" if len(steps) == 1 or len(steps) > 1 and steps[1] - steps[0] > 1 else ls  # not per-step: show the points
+                if self.smooth and len(steps) >= 20 and panel != "lr":  # enough points: smooth (not the schedule)
+                    decay = 2.0 ** (-np.diff(steps) / EMA_HALF_LIFE)  # EMA in step time: the past decays by 2^(-gap / half-life)
+                    smooth = arr.astype(np.float64)  # (copies; ints would truncate the average)
+                    for j in range(1, len(smooth)):
+                        smooth[j] = decay[j - 1] * smooth[j - 1] + (1 - decay[j - 1]) * arr[j]
+                    ax.plot(steps, arr, style, alpha=0.3, lw=0.8, ms=2, color=color)
+                    ax.plot(steps, smooth, ls, lw=1.2, color=color, label=label)
+                else:
+                    ax.plot(steps, arr, style, ms=3, lw=1, color=color, label=label)
             if panel == "eig" and self.eos is not None:
                 ax.axhline(self.eos, color="gray", ls=":", lw=1, label=f"stability threshold {self.eos:g}")
             if len(names) > 1 or panel == "eig":
@@ -147,7 +156,8 @@ class Logger:
             for name in names:
                 tensor = name.rsplit("/", 1)[1]
                 layer, _, kind = tensor.rpartition(".")
-                ax.plot(metrics[name]["step"].numpy(), metrics[name]["value"].numpy(), styles.get(kind, ":"),
+                steps = metrics[name]["step"].numpy()
+                ax.plot(steps, metrics[name]["value"].numpy(), styles.get(kind, ":"), marker="o" if len(steps) == 1 else None,
                         lw=1, color=colors[layer or kind], label=tensor)
             ax.set(title=panel, xlabel="step", **({"yscale": yscale} if yscale is not None else {}))
             ax.title.set_fontsize(9)

@@ -1,11 +1,12 @@
+"""LOBPCG (`torch_lobpcg`, copied and translated into PyTorch from Google's JAX implementation:
+https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L105) and the Hessian eigenvalues it computes (`hessian_eigs`)."""
+
+from typing import Callable, Mapping
+
 import torch
-from typing import Callable
+from torch import Tensor
 
-"""Native PyTorch implementation of the LOBPCG algorithm for eigenvalue computation.
-
-This code was copied (and translated into PyTorch) from Google's JAX implementation:
-https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L105
-"""
+HVP = Callable[[dict[str, Tensor]], dict[str, Tensor]]  # V {name: [m, *shape]} -> H V (batched over the leading dim m)
 
 def torch_lobpcg(
     A: Callable[[torch.Tensor], torch.Tensor], X: torch.Tensor, max_iter=100, rtol=1e-2
@@ -130,3 +131,34 @@ def _extend_basis(X, m):
     h = -2 * torch.linalg.multi_dot([w, w[k:, :].T, other])
     h[k:] += other
     return h
+
+
+def hessian_eigs(
+    hvp: HVP, eigvecs: dict[str, Tensor], precond: Mapping[str, Tensor | float] | None = None, sign: float = 1,
+) -> tuple[Tensor, dict[str, Tensor], int]:
+    """Translate HVP to a function that operates in flat vectors, then call torch_lobpcg.
+    Returns: (eigenvalues [k], eigenvectors like `eigvecs`, LOBPCG iterations).
+    """
+    def flat(d: dict[str, Tensor]) -> Tensor:  # {name: [m, *shape]} -> [#params, m]
+        return torch.cat([v.flatten(1) for v in d.values()], dim=1).T
+
+    def unflat(V: Tensor) -> dict[str, Tensor]:
+        return {
+            name: v.T.reshape(-1, *shape)
+            for v, (name, shape) in zip(V.split([shape.numel() for shape in shapes.values()]), shapes.items())
+        }
+
+    shapes = {name: v.shape[1:] for name, v in eigvecs.items()}
+    sqrt_p = None if precond is None else flat({
+        name: torch.as_tensor(precond[name], dtype=v.dtype, device=v.device).expand(1, *shape)
+        for (name, shape), v in zip(shapes.items(), eigvecs.values())
+    }).sqrt()
+
+    def A(V: Tensor) -> Tensor:  # [#params, m] -> [#params, m] (LOBPCG uses m = k and 3k)
+        if sqrt_p is not None:
+            V = sqrt_p * V
+        HV = flat(hvp(unflat(V)))
+        return sign * (HV if sqrt_p is None else sqrt_p * HV)
+
+    eigvals, V, n_iter = torch_lobpcg(A, flat(eigvecs))
+    return sign * eigvals, unflat(V), n_iter

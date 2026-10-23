@@ -1,6 +1,5 @@
 data/
 __pycache__/
-images/
 .pytest_cache/
 results/
 wandb/

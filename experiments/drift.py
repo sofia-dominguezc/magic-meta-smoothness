@@ -9,25 +9,24 @@ direction_i has operator norm 1, so each tensor moves by eps in the norm of the 
 directions are sampled, `DIRECTIONS`) and "ref" (the center trained plain, unvmapped: its difference to "center" is the
 fp32 rounding of the two kernel paths, the noise floor the perturbations are compared to). Only the parameters are
 perturbed, not the optimizer buffers. Distances between models are the max over tensors of the operator norm of the
-difference (= eps at the start).
+difference (= eps at the start). The two trainings run side by side (two `Magic.train.trace` zipped), everything is
+computed on the live states: nothing is checkpointed.
 
-Outputs in DIR/drift/<direction>_eps<eps>_n<n>_steps<steps>/ (--replot redoes the analysis and plots from models.pt):
-- models.pt: the final states (batched + ref) and the checkpoints every --ckpt-every steps, and the directions
-- drift.png: (1) distance of every model to the center over the steps (log scale), with ref; (2) their losses on
-  --n-test fixed test examples; (3) trajectories of the displacements from the center, projected on the 2 principal
-  directions of the final displacements (a fan = structure along few directions; a cloud = chaos)
+Outputs in DIR/drift/<direction>_eps<eps>_n<n>_steps<steps>/ (--replot redoes the plots from results.json):
+- drift.png: (1) distance of every model to the center at every step (log scale), with ref; (2) their losses on
+  --n-test fixed test examples; (3) trajectories of the displacements from the center (kept every --traj-every steps),
+  projected on the 2 principal directions of the final displacements (a fan = structure along few directions; a cloud = chaos)
 - final.png, for the final models (rows/columns ordered by hierarchical clustering of the distances, center first,
   ref last; the same colors as drift.png): pairwise distances; pairwise cosines of the displacements from the center;
   pairwise distances in function space (RMS of the per-example loss differences on the test examples); per-example
   loss - center's loss (examples sorted by their spread across models); cosines of the initial directions and of the
   final displacements with the top / most negative --n-eigs eigenvectors of the (preconditioned) Hessian at the start
-  state (on the first training batch, as logged by `train`); singular values of the final displacements
+  state (on the first training batch, as logged by train_logged.py); singular values of the final displacements
   (participation ratio = effective number of directions the models spread along)
 - results.json: all of the above as numbers, plus summary statistics
 """
 
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
@@ -40,120 +39,96 @@ from scipy.spatial.distance import squareform
 from torch import Tensor
 
 from main import Experiment
-from src.magic import hessian_eigs, model_call
+from src.eigvals import hessian_eigs
+from src.utils import hvp_fn, model_call
+from src.models import dict_zip
 
 
-def spec_norm(t: Tensor) -> Tensor:
-    """Exact operator norm (the norm of `logging.op_norm`): L2 for vectors, spectral of the [out, -1] matrix."""
-    return t.norm() if t.ndim <= 1 else torch.linalg.matrix_norm(t.flatten(1), ord=2)
+def spec_norms(D: Tensor) -> Tensor:
+    """Exact operator norms (the norm of `logging.op_norm`) of a batch [R, *shape] of parameter-shaped tensors -> [R]:
+    L2 for vectors, spectral of the [out, -1] matrices."""
+    return D.norm(dim=-1) if D.ndim <= 2 else torch.linalg.matrix_norm(D.flatten(2), ord=2)
 
 
 def randn_direction(params: dict[str, Tensor], index: int) -> dict[str, Tensor]:
-    """Gaussian, each tensor normalized to operator norm 1 (like `tangent` in `Magic.train_logged`)."""
+    """Gaussian, each tensor normalized to operator norm 1 (like the tangent of train_logged.py)."""
     g = torch.Generator().manual_seed(index)
     d = {k: torch.randn(p.shape, generator=g, dtype=p.dtype) for k, p in params.items()}
-    return {k: t / spec_norm(t) for k, t in d.items()}
+    return {k: t / spec_norms(t[None])[0] for k, t in d.items()}
 
 
 DIRECTIONS: dict[str, Callable[[dict[str, Tensor], int], dict[str, Tensor]]] = {"randn": randn_direction}
 
 
-def dist(a: dict[str, Tensor], b: dict[str, Tensor]) -> float:
-    return max(spec_norm(a[k].double() - b[k].double()).item() for k in a)
-
-
 def flat(params: dict[str, Tensor]) -> Tensor:
-    return torch.cat([p.double().flatten() for p in params.values()])
+    """[R, *shape] per tensor -> [R, P]"""
+    return torch.cat([p.flatten(1) for p in params.values()], 1)
 
 
-def example_losses(exp: Experiment, params: dict[str, Tensor], indices: Tensor) -> Tensor:
-    """Per-example losses [len(indices)] of the model `params` on the test examples `indices` (on CPU)."""
-    params = {k: p.to(exp.device) for k, p in params.items()}
-    with torch.no_grad():
-        return torch.cat([exp.loss_fn(model_call(exp.model, params, X, bf16=exp.bf16), Y).cpu()
-                          for X, Y in exp.test_loader.iter_batches(indices)])
-
-
-def train(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int, direction: str, ckpt_every: int):
-    """Train center + n perturbed models (vmapped) and the plain reference; save them to out_dir/models.pt."""
-    cfg, magic = exp.cfg, exp.magic
+def run(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int, direction: str, traj_every: int,
+        n_test: int, n_eigs: int) -> dict:
+    """Train center + n perturbed models (vmapped) next to the plain reference, analyze along the way; everything in results.json."""
+    cfg, magic, n = exp.cfg, exp.magic, n_models
     start_state = exp.start_state.apply(lambda t: t.cpu())
-    directions = [DIRECTIONS[direction](start_state.params, i) for i in range(1, n_models + 1)]
-    batched = start_state.apply(lambda t: t.expand(n_models + 1, *t.shape).clone())
+    directions = [DIRECTIONS[direction](start_state.params, i) for i in range(1, n + 1)]
+    batched = start_state.apply(lambda t: t.expand(n + 1, *t.shape).clone())
     for i, d in enumerate(directions, 1):
         for k, t in d.items():
             batched.params[k][i] += eps * t
-    click.echo(f"training the reference and {n_models + 1} models (vmapped) for {steps} steps from step {cfg.start}")
-    ref_final, ref_ckpts = magic.train(start_state, n_steps=steps, start=cfg.start, ckpt_every=ckpt_every)
-    final, ckpts = magic.train(batched, n_steps=steps, start=cfg.start, ckpt_every=ckpt_every)  # batched state: vmapped
-    torch.cuda.empty_cache()  # release the trainings' peak (kept reserved by the caching allocator; a no-op on cpu)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "steps": [cfg.start + i * ckpt_every for i in range(len(ckpts))] + [cfg.start + steps],
-        "states": [asdict(s) for s in [*ckpts, final]], "ref_states": [asdict(s) for s in [*ref_ckpts, ref_final]],
-        "directions": directions, "eps": eps,
-    }, out_dir / "models.pt")
-
-
-def analyze(exp: Experiment, out_dir: Path, n_test: int, n_eigs: int, show: bool) -> dict:
-    """Everything in results.json and the plots, from out_dir/models.pt."""
-    cfg, magic, start_state = exp.cfg, exp.magic, exp.start_state
-    saved = torch.load(out_dir / "models.pt", weights_only=True)
-    states = [type(start_state)(**s) for s in saved["states"]]
-    refs = [type(start_state)(**s) for s in saved["ref_states"]]
-    steps, directions, eps = np.array(saved["steps"]), saved["directions"], saved["eps"]
-    n = len(directions)
     rows = ["center", *map(str, range(1, n + 1)), "ref"]
     test_idx = exp.test_ds.subset(n_test)
+    X, Y = (x.to(exp.device) for x in exp.test_ds.examples(test_idx))
+    example_losses = torch.func.vmap(lambda p: exp.loss_fn(model_call(exp.model, p, X, bf16=exp.bf16), Y))  # batched params -> [R, n_test]
 
-    def params_of(state, i) -> dict[str, Tensor]:  # row i of a batched state
-        return {k: p[i] for k, p in state.params.items()}
+    click.echo(f"training the reference and {n + 1} models (vmapped) for {steps} steps from step {cfg.start}")
+    dists, losses, traj_steps, disps = [], [], [], []  # per step: [n + 1] (ref last), [n + 2]; every traj_every steps: [n + 1, P]
+    vmapped = magic.train.trace(batched, n_steps=steps, start=cfg.start)
+    plain = magic.train.trace(start_state, n_steps=steps, start=cfg.start, pbar=False)
+    for (t, s, _), (_, ref, _) in zip(vmapped, plain):  # (the yielded states are detached: no graphs here)
+        params = {k: torch.cat([p, r[None]]) for k, (p, r) in dict_zip(s.params, ref.params).items()}  # [n + 2, ...]: center, 1..n, ref
+        D = {k: (p[1:] - p[:1]).double() for k, p in params.items()}  # displacements from the center [n + 1, ...]
+        dists.append(torch.stack([spec_norms(d) for d in D.values()]).max(0).values)
+        ell = example_losses(params).double()  # [n + 2, n_test]
+        losses.append(ell.mean(1))
+        if (t - cfg.start) % traj_every == 0 or t == cfg.start + steps:
+            traj_steps.append(t)
+            disps.append(flat(D).float().cpu())
+    dists, losses = torch.stack(dists).cpu().numpy(), torch.stack(losses).cpu().numpy()  # [steps + 1, n + 1], [steps + 1, n + 2]
+    all_steps = list(range(cfg.start, cfg.start + steps + 1))
 
-    # over the steps: distances to the center and test losses, [n_ckpts, n + 1] (last column: ref)
-    dists = np.array([[dist(params_of(s, i), params_of(s, 0)) for i in range(1, n + 1)] + [dist(r.params, params_of(s, 0))]
-                      for s, r in zip(states, refs)])
-    losses = np.array([[example_losses(exp, params_of(s, i), test_idx).mean().item() for i in range(n + 1)]
-                       + [example_losses(exp, r.params, test_idx).mean().item()] for s, r in zip(states, refs)])
-    center = flat(params_of(states[-1], 0))
-    disp = torch.stack([flat(params_of(states[-1], i)) - center for i in range(1, n + 1)])  # final displacements [n, P]
-    disp_ref = flat(refs[-1].params) - center
-    # trajectories in the plane of the top 2 principal directions of the final displacements
+    # the final models: trajectories on the principal directions of the final displacements, pairwise distances in
+    # parameter and function space, cosines of the displacements
+    D_final = disps[-1].double()  # [n + 1, P], ref last
+    disp, Dn = D_final[:n], D_final / D_final.norm(dim=1, keepdim=True)
     _, svals, Vh = torch.linalg.svd(disp, full_matrices=False)
-    traj = np.array([[((flat(params_of(s, i)) - flat(params_of(s, 0))) @ Vh[:2].T).numpy() for i in range(1, n + 1)]
-                     + [((flat(r.params) - flat(params_of(s, 0))) @ Vh[:2].T).numpy()] for s, r in zip(states, refs)])  # [n_ckpts, n + 1, 2]
-
-    # final models: pairwise distances in parameter and function space, cosines of the displacements
-    finals = [params_of(states[-1], i) for i in range(n + 1)] + [refs[-1].params]
-    pdist = np.array([[dist(a, b) for b in finals] for a in finals])
-    ell = torch.stack([example_losses(exp, p, test_idx) for p in finals]).double().numpy()  # [n + 2, n_test]
+    traj = torch.stack([d.double() @ Vh[:2].T for d in disps]).numpy()  # [n_traj, n + 1, 2]
+    pdist = torch.stack([spec_norms((p[:, None] - p[None]).flatten(0, 1).double()).view(n + 2, n + 2) for p in params.values()]).max(0).values.cpu().numpy()
+    ell = ell.cpu().numpy()
     fdist = np.sqrt(((ell[:, None] - ell[None]) ** 2).mean(-1))
-    D = torch.cat([disp, disp_ref[None]])
-    Dn = D / D.norm(dim=1, keepdim=True)
     cos = (Dn @ Dn.T).numpy()
     clustered = leaves_list(linkage(squareform(pdist[1:-1, 1:-1], checks=False), "average", optimal_ordering=True)) if n > 1 else [0]
     order = [0, *(1 + np.array(clustered)).tolist(), n + 1]  # center, perturbed in clustered order, ref
 
     # the directions vs. the Hessian at the start state
-    X, Y, _ = magic.loader.get_batch(cfg.start)
-    params = {k: p.to(magic.device) for k, p in start_state.params.items()}
-    vjp_fn = torch.func.vjp(lambda p: magic.grad_fn(p, X, Y), params)[1]
-    hvp = lambda v: vjp_fn(v)[0]  # v -> H v on params dicts
+    X0, Y0, _ = magic.loader.get_batch(cfg.start)
+    params0 = {k: p.to(magic.device) for k, p in start_state.params.items()}
+    hvp = hvp_fn(exp.model, exp.loss_fn, params0, X0, Y0, bf16=exp.bf16)  # V -> H V on batched params dicts
     eig_names, eigvecs, eigvals, g = [], [], [], torch.Generator().manual_seed(0)
     for sign in [1, -1]:
-        start = {k: torch.randn(n_eigs, *p.shape, generator=g, dtype=p.dtype).to(p.device) for k, p in params.items()}
+        start = {k: torch.randn(n_eigs, *p.shape, generator=g, dtype=p.dtype).to(p.device) for k, p in params0.items()}
         vals, vecs, _ = hessian_eigs(hvp, start, start_state.precond(cfg.start), sign)
         eig_names += [f"eig {'-' if sign < 0 else ''}{i + 1}" for i in range(n_eigs)]
-        eigvecs.append(torch.stack([flat({k: v[i] for k, v in vecs.items()}) for i in range(n_eigs)], 1).cpu())
+        eigvecs.append(flat(vecs).T.double().cpu())  # [P, n_eigs]
         eigvals += (vals.detach().cpu() * (2 / start_state.stability_threshold)).tolist()
     V = torch.cat(eigvecs, dim=1)  # [P, 2 n_eigs]
-    dirs = torch.stack([flat(d) for d in directions])
+    dirs = torch.cat([flat({k: t[None] for k, t in d.items()}) for d in directions]).double()  # [n, P]
     eig_cos = {
         "initial direction": ((dirs / dirs.norm(dim=1, keepdim=True)) @ V).numpy(),  # [n, 2 n_eigs]
         "final displacement": (Dn @ V).numpy(),  # [n + 1, 2 n_eigs]
     }
 
     results = {
-        "eps": eps, "steps": steps.tolist(), "rows": rows, "order": order,
+        "eps": eps, "steps": all_steps, "traj_steps": traj_steps, "rows": rows, "order": order,
         "dist_to_center": dists.tolist(), "test_loss": losses.tolist(), "trajectories": traj.tolist(),
         "pairwise_dist": pdist.tolist(), "pairwise_function_dist": fdist.tolist(), "displacement_cos": cos.tolist(),
         "example_loss": ell.tolist(), "eigvals": dict(zip(eig_names, eigvals)),
@@ -167,10 +142,10 @@ def analyze(exp: Experiment, out_dir: Path, n_test: int, n_eigs: int, show: bool
             "perturbed std": float(losses[-1, 1:-1].std()),
         },
     }
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.json").write_text(json.dumps(results, indent=2))
     for k, v in results["summary"].items():
         click.echo(f"  {k}: {v:.4g}")
-    plot(out_dir, results, exp.name, show)
     return results
 
 
@@ -251,19 +226,21 @@ def plot(out_dir: Path, results: dict, title: str, show: bool):
 @click.option("--eps", type=float, default=1e-3, show_default=True, help="operator norm of the perturbation of every tensor")
 @click.option("--steps", type=int, default=None, help="train this many steps from `start` (default: n_steps - start)")
 @click.option("--direction", type=click.Choice(list(DIRECTIONS)), default="randn", show_default=True, help="how the directions are sampled")
-@click.option("--ckpt-every", type=int, default=None, help="checkpoint (and so plot) every this many steps (default: ~50 points)")
+@click.option("--traj-every", type=int, default=None, help="keep the displacements for the trajectory plot every this many steps (default: ~50 points)")
 @click.option("--n-test", type=int, default=10, show_default=True, help="fixed test examples the losses are compared on")
 @click.option("--n-eigs", type=int, default=2, show_default=True, help="top and most negative Hessian eigenvectors the directions are compared to")
 @click.option("--device", type=str, default="cpu", show_default=True)
-@click.option("--replot", is_flag=True, help="only redo the analysis and plots from models.pt")
+@click.option("--replot", is_flag=True, help="only redo the plots from results.json")
 @click.option("--show/--no-show", default=True, help="show the plots")
-def main(exp_dir, n_models, eps, steps, direction, ckpt_every, n_test, n_eigs, device, replot, show):
+def main(exp_dir, n_models, eps, steps, direction, traj_every, n_test, n_eigs, device, replot, show):
     exp = Experiment(exp_dir, device)
     steps = exp.cfg.n_steps - exp.cfg.start if steps is None else steps
     out_dir = exp_dir / "drift" / f"{direction}_eps{eps:g}_n{n_models}_steps{steps}"
-    if not replot:
-        train(exp, out_dir, n_models, eps, steps, direction, ckpt_every or max(1, steps // 50))
-    analyze(exp, out_dir, n_test, n_eigs, show)
+    if replot:
+        results = json.loads((out_dir / "results.json").read_text())
+    else:
+        results = run(exp, out_dir, n_models, eps, steps, direction, traj_every or max(1, steps // 50), n_test, n_eigs)
+    plot(out_dir, results, exp.name, show)
 
 
 if __name__ == "__main__":

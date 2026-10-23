@@ -109,17 +109,20 @@ class Loader:
     seed: int = 0
     _perm: tuple[int, Tensor] | None = field(default=None, repr=False)  # (epoch, its permutation), cached
 
-    def get_batch(self, step: int) -> tuple[Tensor, Tensor, Tensor]:
-        """The training batch of `step`: (X, Y, indices). Epochs of len(dataset) // batch_size batches without
-        replacement: a permutation per epoch (seeded by `seed` and the epoch); its last len % batch_size examples
-        are skipped."""
+    def batch_indices(self, step: int) -> Tensor:
+        """The examples (CPU indices) of the training batch of `step`: epochs of len // batch_size batches without
+        replacement (a permutation per epoch, seeded by `seed` and the epoch; its last len % batch_size examples are skipped)"""
         n_batches = len(self.dataset) // self.batch_size
         assert n_batches > 0, f"batch size {self.batch_size} > {len(self.dataset)} examples"
         epoch, i = divmod(step, n_batches)
         if self._perm is None or self._perm[0] != epoch:
             g = torch.Generator().manual_seed(self.seed * 2**20 + epoch)  # (the CPU generator keeps the low 32 bits)
             self._perm = (epoch, torch.randperm(len(self.dataset), generator=g))
-        idx = self._perm[1][i * self.batch_size : (i + 1) * self.batch_size]
+        return self._perm[1][i * self.batch_size : (i + 1) * self.batch_size]
+
+    def get_batch(self, step: int) -> tuple[Tensor, Tensor, Tensor]:
+        """The training batch of `step` (`batch_indices`) on `device`: (X, Y, indices)."""
+        idx = self.batch_indices(step)
         X, Y = self.dataset.examples(idx)
         X, Y, idx = (t.to(self.device, non_blocking=True) for t in (X, Y, idx))
         return X, Y, idx

@@ -5,13 +5,13 @@ with the steps?
   python -m experiments.vmap_error DIR [--device cpu] [--no-show]
 
 Trains the experiment's full model (config in DIR: same init and batches, all the weights 1; the model forward in
-bfloat16 if the config's dtype is bf16, as in retrain) with fp64 and with fp32 states, each
-- "plain": `Magic.train` without weights (torch.func.grad, no vmap), as run-magic's reference f(s_T)
+bfloat16 if the config's dtype is bf16, as in train) with fp64 and with fp32 states, each
+- "plain": `Magic.train` without weights (no vmap), as the full model of train and magic's reference f(s_T)
 - "vmap":  `Magic.train` vmapped with 2 copies (row 0 is taken; the rows are identical with deterministic kernels),
-           as retrain does
+           as train does for the perturbed models
 Saves DIR/vmap_error.png: per dtype (columns, same axes), the operator norms (`logging.op_norm`, like the other norm
 plots: raw parameters are O(1) in it) of the differences vmap - plain of each parameter along training, and the
-absolute difference of their test losses (on the same 1000 test examples as train's test_loss), in log scale, plus
+absolute difference of their test losses (on 1000 test examples), in log scale, plus
 a third column with the same for fp32 plain - fp64 plain (the fp32 rounding of the states and kernels);
 DIR/vmap_error_linear.png: the same in linear scale over the second half of the steps; and DIR/vmap_error.json: these
 values, the test losses and the peak GPU memory of each run (--replot redoes the plots from it).
@@ -29,7 +29,7 @@ import torch
 
 from main import DTYPES, Experiment
 from src.logging import op_norm
-from src.magic import eval_loss
+from src.utils import eval_loss
 
 
 def vmap_error(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
@@ -48,11 +48,11 @@ def vmap_error(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
         for name in ["plain", "vmap"]:
             if device.startswith("cuda"):
                 torch.cuda.reset_peak_memory_stats()
-            final, ckpts = magic.train(
-                init_state.apply(lambda t: t.to(DTYPES[dtype])), n_steps=cfg.n_steps, ckpt_every=ckpt_every,
+            run = magic.train.trace(
+                init_state.apply(lambda t: t.to(DTYPES[dtype])), n_steps=cfg.n_steps,
                 weights=torch.ones(2, len(exp.train_ds)) if name == "vmap" else None,
             )
-            states = [*ckpts, final]
+            states = [s.apply(lambda t: t.to("cpu", copy=True)) for t, s, _ in run if t % ckpt_every == 0 or t == cfg.n_steps]
             runs[dtype][name] = [s.apply(lambda t: t[0]) for s in states] if name == "vmap" else states
             res["peak_gpu_mb"][name] = torch.cuda.max_memory_allocated() / 2**20 if device.startswith("cuda") else float("nan")
             res["test_loss"][name] = [

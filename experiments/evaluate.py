@@ -27,7 +27,7 @@ import torch
 from tqdm import tqdm
 
 from main import Experiment
-from src.magic import eval_loss
+from src.utils import eval_loss
 
 
 def natural(name: str) -> list:

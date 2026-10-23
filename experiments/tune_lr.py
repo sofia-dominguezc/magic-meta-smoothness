@@ -17,7 +17,7 @@ import torch
 from tqdm import tqdm
 
 from main import Experiment
-from src.magic import eval_loss
+from src.utils import eval_loss
 
 
 def tune_lr(exp_dir: Path, lrs: list[float], steps: int | None = None, device: str = "cpu", compile: bool = False, show: bool = True) -> float:
@@ -28,7 +28,7 @@ def tune_lr(exp_dir: Path, lrs: list[float], steps: int | None = None, device: s
     losses, accs = [], []
     for lr in tqdm(lrs, desc="learning rates"):
         init_state = replace(exp.init_state, lr=replace(exp.init_state.lr, lr=lr))
-        final, _ = exp.magic.train(init_state, n_steps=steps)
+        final = exp.magic.train(init_state, n_steps=steps)
         loss, metrics, _ = eval_loss(exp.model, exp.loss_fn, {k: p.to(device) for k, p in final.params.items()}, exp.test_loader, all_test, bf16=exp.bf16)
         losses.append(loss.item() if math.isfinite(loss.item()) else math.inf)
         accs.append(metrics["acc"].item())
