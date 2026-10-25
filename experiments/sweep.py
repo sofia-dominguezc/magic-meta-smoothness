@@ -4,7 +4,7 @@ Run a whole experiment on DIR (created with `python main.py new DIR ...`) and ev
   python -m experiments.sweep DIR --kind drop --alphas 0.01,0.02,0.05 --n-train-subsets 10 --n-eval-subsets 5
 
 1. experiments/tune_lr.py if the config has no lr
-2. `train` for each alpha: the full model (if missing) and n-train-subsets perturbed models
+2. `train`: the full model (if missing) and n-train-subsets perturbed models per alpha (one vmapped pass)
 3. `magic` with n-eval-subsets eval subsets of n-test test examples
 4. experiments/evaluate.py: the scatter grid per alpha, the pooled ccc per alpha and its plot vs. alpha
 Running it again on the same DIR only trains / differentiates what is missing (new alphas, more subsets), and the
@@ -36,8 +36,8 @@ def main(exp_dir, kind, alphas, n_train_subsets, n_eval_subsets, n_test, device,
     common = ["--device", device, "--compile" if compile else "--no-compile"]
     if json.loads((Path(exp_dir) / "config.json").read_text())["lr"] is None:
         tune_lr(Path(exp_dir), [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2], device=device, compile=compile, show=False)
-    for alpha in alphas.split(","):
-        cli(["train", exp_dir, "--kind", kind, "--alpha", alpha, "--n-subsets", str(n_train_subsets), "--no-show", *common], standalone_mode=False)
+    alpha_args = [arg for alpha in alphas.split(",") for arg in ("--alpha", alpha)]
+    cli(["train", exp_dir, "--kind", kind, *alpha_args, "--n-subsets", str(n_train_subsets), "--no-show", *common], standalone_mode=False)
     cli(["magic", exp_dir, "--n-test", str(n_test), "--n-subsets", str(n_eval_subsets), "--no-show", *common], standalone_mode=False)
     evaluate(Path(exp_dir), device, show)
 

@@ -20,9 +20,9 @@ from torch import Tensor
 
 from main import Experiment
 from src.logging import Logger
-from src.eigvals import hessian_eigs
-from src.utils import eval_loss, hvp_fn
-from src.models import OptimState, dict_zip
+from src.lobpcg import hessian_eigs
+from src.utils import dict_zip
+from src.optimizers import OptimState
 
 
 def rayleigh(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 1, num_neg_eigs: int = 1, eig_every: int = 10,
@@ -38,9 +38,9 @@ def rayleigh(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 1, num_neg_
     def hvp_at(state: OptimState, t: int):
         """V -> H_t V: the Hessian of the batch loss of step `t` at `state`."""
         X, Y, _ = magic.loader.get_batch(t)
-        return hvp_fn(magic.model, magic.loss_fn, state.params, X, Y, bf16=magic.bf16)
+        return magic.hvp_fn(state.params, X, Y)
 
-    def log_eigs(t: int, state: OptimState, hvp, warm: dict[int, dict[str, Tensor]]) -> dict[int, dict[str, Tensor]]:
+    def log_eigs(t: int, state: OptimState, hvp_fn, warm: dict[int, dict[str, Tensor]]) -> dict[int, dict[str, Tensor]]:
         """Log the eigenvalues "eig/i" of sqrt(P_t) H_t sqrt(P_t) (LOBPCG from `warm`, random for a missing sign).
         Returns the eigenvectors {sign: {name: [k, *shape]}}."""
         eigvecs = {}
@@ -48,7 +48,7 @@ def rayleigh(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 1, num_neg_
             if sign not in warm:
                 g = torch.Generator().manual_seed(t)
                 warm[sign] = {name: torch.randn(k, *p.shape, generator=g, dtype=p.dtype).to(p.device) for name, p in state.params.items()}
-            eigvals, eigvecs[sign], _ = hessian_eigs(hvp, warm[sign], state.precond(t), sign)
+            eigvals, eigvecs[sign], _ = hessian_eigs(hvp_fn, warm[sign], state.precond(t), sign)
             logger.log(t, **{f"eig/{sign * (i + 1)}": lam for i, lam in enumerate(eigvals.unbind())})
             if t == T:
                 click.echo(f"final eigenvalues, sign {sign}: {eigvals.tolist()}")
@@ -65,24 +65,24 @@ def rayleigh(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 1, num_neg_
     # the final eigenvectors V, and the starting vector df/ds_T
     final = exp.load_state(exp_dir / "full_model" / "final.pt").apply(lambda s: s.to(device))
     V = log_eigs(T, final, hvp_at(final, T), {})
-    indices = exp.test_ds.subset(n_test, index=0)
-    _, _, f_grad = eval_loss(magic.model, magic.loss_fn, final.params, exp.test_loader, indices, grad=True, bf16=magic.bf16)
-    log_cos(T, f_grad)
+    X_f, Y_f = (x.to(device) for x in exp.test_ds.examples(exp.test_ds.subset(n_test, index=0)))  # the eval set of f
+    params = {k: p.detach().requires_grad_() for k, p in final.params.items()}
+    log_cos(T, torch.autograd.grad(magic.forward(params, X_f, Y_f)[0].mean(), params))
 
     # backward through the training
     tracked = set(exp.train_ds.subset(n_track, index=0).tolist()) if n_track else set()
     warm = dict(V)
     for t, state, delta, d_weights in magic.backprop.trace(
-        exp.start_state, n_steps=T - start, start=start, test_loader=exp.test_loader, eval_sets={"f": indices}, passes=passes
+        exp.start_state, n_steps=T - start, start=start, eval_sets=[(X_f, Y_f)], passes=passes
     ):
-        hvp, P = hvp_at(state, t), state.precond(t)
+        hvp_fn, P = hvp_at(state, t), state.precond(t)
         for sign, vecs in V.items():  # Rayleigh quotients of the final eigenvectors
             U = {name: torch.as_tensor(P[name], dtype=v.dtype, device=v.device).sqrt() * v for name, v in vecs.items()}  # sqrt(P_t) v_i
-            q = torch.stack([(u * hu).flatten(1).sum(1) for u, hu in dict_zip(U, hvp(U)).values()]).sum(0)  # [k]
+            q = torch.stack([(u * hu).flatten(1).sum(1) for u, hu in dict_zip(U, hvp_fn(U)).values()]).sum(0)  # [k]
             logger.log(t, **{f"eig/{sign * (i + 1)}: v^T H_t v": qi for i, qi in enumerate(q.unbind())})
         if eig_every and (t - start) % eig_every == 0:  # the actual eigenvalues, same batch and state
-            warm = log_eigs(t, state, hvp, warm)
-        del hvp
+            warm = log_eigs(t, state, hvp_fn, warm)
+        del hvp_fn
         log_cos(t, {name: d[0] for name, d in delta.params.items()})
         logger.log_norms(t, "delta", delta.apply(lambda d: d[0]))
         positions = {j: p for p, j in enumerate(magic.loader.batch_indices(t).tolist()) if j in tracked}  # example -> position

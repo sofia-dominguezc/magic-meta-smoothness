@@ -35,7 +35,8 @@ import torch
 from src.data import DATASETS, Dataset, Loader
 from src.magic import Magic
 from src.utils import LOSSES
-from src.models import MODELS, AdamState, LRSchedule, OptimState, SGDMomentumState, SGDState
+from src.models import MODELS
+from src.optimizers import AdamState, LRSchedule, NewtonState, OptimState, SGDMomentumState, SGDState, SharpnessState
 from src.logging import Logger
 
 
@@ -43,12 +44,14 @@ from src.logging import Logger
 class ExperimentConfig:
     dataset: str = "mnist"
     model: str = "cnn"
+    width: int | None = None  # of the model (mlp: hidden, cnn: channels of the 1st stage, vit: embedding; None: the model's default)
     loss: str = "ce"
     init_seed: int = 0
     data_seed: int = 0
     n_train: int | None = None  # train on a random subset of this many examples (seeded by data_seed; None: all)
     batch_size: int = 32
-    optimizer: str = "sgd"  # sgd, momentum or adam
+    optimizer: str = "sgd"  # sgd, momentum, adam, sharpness (SGD with the step size lr / top Hessian eigenvalue) or newton
+    damping: float = 0.01  # newton only
     lr: float | None = None
     lr_schedule: str = "constant"  # or cosine, after `warmup` linear steps (models.LRSchedule)
     warmup: int = 0
@@ -56,8 +59,8 @@ class ExperimentConfig:
     beta2: float = 0.999  # adam only
     weight_decay: float = 0.0
     n_steps: int = 400
-    start: int = 0  # the training weights are perturbed / differentiated from this step on
-    dtype: str = "fp32"  # of the states, losses and df/dw: fp32 or fp64; bf16: fp32 states, model forward in bfloat16
+    start: int = 0  # train for this many steps before changing weights/logging
+    dtype: str = "fp32"  # fp32 or fp64. bf16: fp32 states with bfloat16 autocast
 
 
 DTYPES = {"fp32": torch.float32, "fp64": torch.float64, "bf16": torch.float32}  # of the states
@@ -85,7 +88,8 @@ class Experiment:
         cfg = self.cfg
         schedule = ("" if cfg.lr_schedule == "constant" else f" {cfg.lr_schedule}") + (f" warmup {cfg.warmup}" if cfg.warmup else "")
         data = cfg.dataset if cfg.n_train is None else f"{cfg.n_train} examples of {cfg.dataset}"
-        return f"{cfg.model} on {data}, {cfg.loss}, {cfg.optimizer} lr {cfg.lr:g}{schedule}, steps {cfg.start}-{cfg.n_steps}"
+        model = cfg.model if cfg.width is None else f"{cfg.model} (width {cfg.width})"
+        return f"{model} on {data}, {cfg.loss}, {cfg.optimizer} lr {cfg.lr:g}{schedule}, steps {cfg.start}-{cfg.n_steps}"
 
     @property
     def bf16(self) -> bool:
@@ -117,7 +121,8 @@ class Experiment:
     @cached_property
     def model(self) -> torch.nn.Module:
         torch.manual_seed(self.cfg.init_seed)
-        return MODELS[self.cfg.model](self.train_ds.in_shape, self.train_ds.out_dim).to(self.device)
+        width = {} if self.cfg.width is None else {"width": self.cfg.width}
+        return MODELS[self.cfg.model](self.train_ds.in_shape, self.train_ds.out_dim, **width).to(self.device)
 
     @cached_property
     def init_state(self) -> OptimState:
@@ -128,11 +133,15 @@ class Experiment:
         schedule = LRSchedule(cfg.lr, kind=cfg.lr_schedule, warmup=cfg.warmup, n_steps=cfg.n_steps)
         params = {k: p.detach().clone() for k, p in self.model.named_parameters()}
         if cfg.optimizer == "adam":
-            return AdamState(params=params, lr=schedule, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+            return AdamState(params=params, lr=schedule, betas=(cfg.beta1, cfg.beta2), wd=cfg.weight_decay)
         if cfg.optimizer == "momentum":
-            return SGDMomentumState(params=params, lr=schedule, weight_decay=cfg.weight_decay, momentum=cfg.beta1)
+            return SGDMomentumState(params=params, lr=schedule, wd=cfg.weight_decay, momentum=cfg.beta1)
+        if cfg.optimizer == "sharpness":
+            return SharpnessState(params=params, lr=schedule, wd=cfg.weight_decay)
+        if cfg.optimizer == "newton":
+            return NewtonState(params=params, lr=schedule, wd=cfg.weight_decay, damping=cfg.damping)
         assert cfg.optimizer == "sgd", cfg.optimizer
-        return SGDState(params=params, lr=schedule, weight_decay=cfg.weight_decay)
+        return SGDState(params=params, lr=schedule, wd=cfg.weight_decay)
 
     @cached_property
     def magic(self) -> Magic:
@@ -173,17 +182,19 @@ def main():
 @click.option("--dataset", type=click.Choice(list(DATASETS)), default="mnist", show_default=True)
 @click.option("--model", type=click.Choice(list(MODELS)), default="cnn", show_default=True)
 @click.option("--loss", type=click.Choice(list(LOSSES)), default="ce", show_default=True)
+@click.option("--width", type=int, default=None, help="of the model (mlp: hidden, cnn: channels of the 1st stage, vit: embedding; default: 512 / 32 / 96; cnn 6 ~ 11k params)")
 @click.option("--init-seed", type=int, default=0, show_default=True)
 @click.option("--data-seed", type=int, default=0, show_default=True, help="seed of the batch order (and of the --n-train subset)")
 @click.option("--n-train", type=int, default=None, help="train on a random subset of this many examples (default: all)")
 @click.option("--batch-size", type=int, default=32, show_default=True)
-@click.option("--optimizer", type=click.Choice(["sgd", "momentum", "adam"]), default="sgd", show_default=True)
+@click.option("--optimizer", type=click.Choice(["sgd", "momentum", "adam", "sharpness", "newton"]), default="sgd", show_default=True, help="sharpness: SGD with the step size lr * 2 / sharpness")
 @click.option("--lr", type=float, default=None, help="learning rate (default: set by experiments/tune_lr.py)")
 @click.option("--lr-schedule", type=click.Choice(LR_SCHEDULES), default="constant", show_default=True, help=f"cosine: from lr to {LRSchedule.FINAL_FRACTION:g} lr at n_steps")
 @click.option("--warmup", type=int, default=0, show_default=True, help="linear warmup of the lr over this many steps")
 @click.option("--beta1", type=float, default=0.9, show_default=True, help="the momentum of momentum, beta1 of adam")
 @click.option("--beta2", type=float, default=0.999, show_default=True, help="beta2 of adam")
 @click.option("--weight-decay", type=float, default=0.0, show_default=True)
+@click.option("--damping", type=float, default=0.1, show_default=True, help="newton: added to the Hessian's diagonal")
 @click.option("--n-steps", type=int, default=400, show_default=True)
 @click.option("--start", type=int, default=0, show_default=True, help="perturb / differentiate the training weights from this step on (trained on all the data before)")
 @click.option("--dtype", type=click.Choice(list(DTYPES)), default="fp32", show_default=True, help="of the states, losses and df/dw; bf16 = fp32 states, model forward in bfloat16")
@@ -204,12 +215,12 @@ def new(exp_dir: Path, **kwargs):
 @exp_dir
 @device_option
 @compile_option
-@click.option("--kind", type=click.Choice(["drop", "randn"]), default="drop", show_default=True)
-@click.option("--alpha", type=float, default=0.05, show_default=True, help="size of the perturbation")
-@click.option("--n-subsets", type=int, default=10, show_default=True, help="perturbed models (indices 0, ..., n-1; 0: only the full model)")
+@click.option("--kind", type=click.Choice(["drop", "randn"]), default="randn", show_default=True)
+@click.option("--alpha", "alphas", type=float, multiple=True, default=[0.05], show_default=True, help="size of the perturbation (repeatable: all the models in one vmapped pass)")
+@click.option("--n-subsets", type=int, default=0, show_default=True, help="perturbed models (indices 0, ..., n-1; 0: only the full model)")
 @click.option("--vmap-limit", type=int, default=None, help="train at most this many models per vmapped pass (default: all at once)")
 @show_option
-def train(exp_dir, device, compile, kind, alpha, n_subsets, vmap_limit, show):
+def train(exp_dir, device, compile, kind, alphas, n_subsets, vmap_limit, show):
     exp = Experiment(exp_dir, device, compile)
     cfg = exp.cfg
     n_steps = cfg.n_steps - cfg.start
@@ -221,11 +232,11 @@ def train(exp_dir, device, compile, kind, alpha, n_subsets, vmap_limit, show):
         torch.save(asdict(final), full_dir / "final.pt")
         logger.finish(full_dir / "metrics.pt")
 
-    runs = {i: exp_dir / "retrained" / f"{kind}_{alpha:g}_{i}" for i in range(n_subsets)}  # index -> dir
-    runs = {i: d for i, d in runs.items() if not (d / "final.pt").exists()}
-    weights = [exp.train_ds.weights(kind, alpha, index=i) for i in runs]
+    runs = {(alpha, i): exp_dir / "retrained" / f"{kind}_{alpha:g}_{i}" for alpha in alphas for i in range(n_subsets)}  # -> dir
+    runs = {key: d for key, d in runs.items() if not (d / "final.pt").exists()}
+    weights = [exp.train_ds.weights(kind, alpha, index=i) for alpha, i in runs]
     paths = [d / "final.pt" for d in runs.values()]
-    limit = vmap_limit or len(weights)
+    limit = vmap_limit or len(weights) or 1
     if weights:
         click.echo(f"training {len(weights)} perturbed models" + (f" in chunks of {limit}" if limit < len(weights) else ""))
     for c in range(0, len(weights), limit):
@@ -233,7 +244,7 @@ def train(exp_dir, device, compile, kind, alpha, n_subsets, vmap_limit, show):
         for r, path in enumerate(paths[c:c + limit]):
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(asdict(final.apply(lambda t: t[r])), path)
-    for d, w in zip(runs.values(), weights):
+    for ((alpha, _), d), w in zip(runs.items(), weights):
         torch.save({"weights": w, "kind": kind, "alpha": alpha}, d / "perturbation.pt")
     if show:
         plt.show()
@@ -249,26 +260,33 @@ def train(exp_dir, device, compile, kind, alpha, n_subsets, vmap_limit, show):
 @click.option("--n-test", type=int, default=10, show_default=True, help="test examples in each eval set (a fixed random subset): f is their mean loss")
 @click.option("--n-subsets", type=int, default=1, show_default=True, help="eval sets (indices 0, ..., n-1)")
 @click.option("--passes", type=int, default=2, show_default=True, help="re-trainings to reconstruct the states in reverse (memory: passes * steps^(1/passes) states)")
+@click.option("--vmap-limit", type=int, default=None, help="backpropagate at most this many eval sets at a time, a replay each (default: all at once; only the first chunk is logged)")
 @show_option
-def magic(exp_dir, device, compile, n_test, n_subsets, passes, show):
+def magic(exp_dir, device, compile, n_test, n_subsets, passes, vmap_limit, show):
     exp = Experiment(exp_dir, device, compile)
     cfg = exp.cfg
     magic_dir = exp_dir / "magic"
-    sets = {i: (f"{n_test} examples #{i}", magic_dir / f"{n_test}_examples_{i}") for i in range(n_subsets)}  # index -> (name, dir)
-    sets = {i: (name, d) for i, (name, d) in sets.items() if not (d / "linearization.pt").exists()}
-    eval_sets = {name: exp.test_ds.subset(n_test, index=i) for i, (name, _) in sets.items()}  # name -> test examples
-    click.echo(f"backpropagating {len(eval_sets)} eval sets")
-    if not eval_sets:
+    dirs = {i: magic_dir / f"{n_test}_examples_{i}" for i in range(n_subsets)}  # index -> dir
+    dirs = {i: d for i, d in dirs.items() if not (d / "linearization.pt").exists()}
+    if not dirs:
         return
+    indices = [exp.test_ds.subset(n_test, index=i) for i in dirs]  # the test examples of each eval set
+    limit = vmap_limit or len(dirs)
+    click.echo(f"backpropagating {len(dirs)} eval sets" + (f" in chunks of {limit}" if limit < len(dirs) else ""))
     logger = Logger(f"MAGIC: df/ds_t and df/dw_t; {exp.name}", smooth=False)
-    outputs, betas = exp.magic.backprop(
-        exp.start_state, n_steps=cfg.n_steps - cfg.start, start=cfg.start, test_loader=exp.test_loader, eval_sets=eval_sets,
-        passes=passes, log=logger,
-    )
-    for name, d in sets.values():
+    eval_sets = [exp.test_ds.examples(idx) for idx in indices]
+    outputs, betas = [], []  # per chunk: f(s_T) [#fns], df/dw [#fns, N]
+    for c in range(0, len(eval_sets), limit):
+        output, beta = exp.magic.backprop(
+            exp.start_state, n_steps=cfg.n_steps - cfg.start, start=cfg.start, eval_sets=eval_sets[c:c + limit],
+            passes=passes, log=logger if c == 0 else None,
+        )
+        outputs.append(output)
+        betas.append(beta)
+    for (i, d), idx, output, beta in zip(dirs.items(), indices, torch.cat(outputs), torch.cat(betas)):
         d.mkdir(parents=True, exist_ok=True)
-        torch.save({"indices": eval_sets[name], "output": outputs[name].cpu(), "beta": betas[name].cpu()}, d / "linearization.pt")
-        click.echo(f"  {name}: f = {outputs[name].item():.4f}")
+        torch.save({"indices": idx, "output": output.cpu(), "beta": beta.cpu()}, d / "linearization.pt")
+        click.echo(f"  {n_test} examples #{i}: f = {output.item():.4f}")
     logger.finish(magic_dir / "metrics.pt")
     if show:
         plt.show()

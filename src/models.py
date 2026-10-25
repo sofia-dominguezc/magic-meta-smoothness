@@ -1,11 +1,9 @@
 """Models in the spectral form of μP (Yang, Simon & Bernstein 2023, "A spectral condition for feature learning"): layers
 store raw tensors with O(1) operator norm (`logging.op_norm`) behind fixed forward multipliers (`Linear`), so that one
-learning rate serves every raw tensor and transfers across widths (`OptimState.precond`). Normalization layers are
+learning rate serves every raw tensor and transfers across widths (`optimizers.OptimState.precond`). Normalization layers are
 parameter-free: the training state is the parameters. Seed with torch.manual_seed before creating a model."""
 
 import math
-from dataclasses import dataclass, replace
-from typing import Callable, ClassVar, Iterator, Iterable, Mapping, Self
 
 import torch
 from torch import Tensor, nn
@@ -15,7 +13,7 @@ import torch.nn.functional as F
 def mu_init_(layer: nn.Linear | nn.Conv2d, readout: bool = False):
     fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(layer.weight)
     nn.init.normal_(layer.weight, std=(fan_out * (fan_in if readout else 1)) ** -0.5)
-    if hasattr(layer, "bias"):
+    if layer.bias is not None:
         nn.init.zeros_(layer.bias)
 
 
@@ -118,16 +116,16 @@ class TransformerBlock(nn.Module):
 
 class ViT(nn.Module):
     """Pre-norm ViT with `patch` x `patch` patches, learned positional embeddings (a bias-like raw tensor:
-    N(0, 1/dim), used as sqrt(dim) * pos), heads of `head_dim` dims, mean pooling and a linear readout."""
+    N(0, 1/width), used as sqrt(width) * pos), heads of `head_dim` dims, mean pooling and a linear readout."""
 
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, dim: int = 96, depth: int = 3, head_dim: int = 32, patch: int = 4):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 96, depth: int = 3, head_dim: int = 32, patch: int = 4):
         super().__init__()
         C, H, W = in_shape
         self.patch = patch
-        self.embed = Linear(C * patch * patch, dim)
-        self.pos = nn.Parameter(torch.randn((H // patch) * (W // patch), dim) / dim**0.5)
-        self.blocks = nn.ModuleList(TransformerBlock(dim, dim // head_dim) for _ in range(depth))
-        self.out = Linear(dim, out_dim, readout=True)
+        self.embed = Linear(C * patch * patch, width)
+        self.pos = nn.Parameter(torch.randn((H // patch) * (W // patch), width) / width**0.5)
+        self.blocks = nn.ModuleList(TransformerBlock(width, width // head_dim) for _ in range(depth))
+        self.out = Linear(width, out_dim, readout=True)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
@@ -140,163 +138,3 @@ class ViT(nn.Module):
 
 
 MODELS: dict[str, type[nn.Module]] = {"mlp": MLP, "cnn": ResNet, "vit": ViT}
-
-
-def dict_zip[T](*dicts: Mapping[str, T]) -> dict[str, tuple[T, ...]]:
-    """e.g. {"a": 1, "b": 2}, {"a": 3, "b": 4} -> {"a": (1, 3), "b": (2, 4)}"""
-    assert all(set(dicts[0]) == set(d) for d in dicts)
-    return {key: tuple(d[key] for d in dicts) for key in dicts[0]}
-
-
-@dataclass(frozen=True)
-class LRSchedule:
-    """The learning rate at step t (`schedule(t)`): linear warmup to `lr` over `warmup` steps, then
-    - "constant": lr
-    - "cosine": from lr at step `warmup` to FINAL_FRACTION * lr at step `n_steps`
-    """
-
-    lr: float
-    kind: str = "constant"
-    warmup: int = 0
-    n_steps: int = 0
-    FINAL_FRACTION: ClassVar[float] = 0.1
-
-    def __call__(self, t: int) -> float:
-        if t < self.warmup:
-            return self.lr * (t + 1) / self.warmup
-        if self.kind == "constant":
-            return self.lr
-        assert self.kind == "cosine", self.kind
-        progress = min(1.0, (t - self.warmup) / max(1, self.n_steps - self.warmup))
-        return self.lr * (self.FINAL_FRACTION + (1 - self.FINAL_FRACTION) * (1 + math.cos(math.pi * progress)) / 2)
-
-
-@dataclass(kw_only=True)
-class OptimState:
-    """All model + optimizer state tensors (the dict fields named in `groups`) and the step on them."""
-
-    groups: ClassVar[tuple[str, ...]] = ("params",)
-    params: dict[str, Tensor]  # model parameters
-    lr: LRSchedule
-    weight_decay: float = 0.0
-
-    def __post_init__(self):
-        if isinstance(self.lr, dict):  # saved by `asdict`
-            self.lr = LRSchedule(**self.lr)
-
-    def __iter__(self) -> Iterator[Tensor]:
-        return (t for group in self.groups for t in getattr(self, group).values())
-
-    def apply(self, fn: Callable[[Tensor], Tensor]) -> Self:
-        """A copy of the state with each tensor replaced by `fn(tensor)`"""
-        return replace(self, **{group: {k: fn(t) for k, t in getattr(self, group).items()} for group in self.groups})
-
-    def unflatten(self, tensors: Iterable[Tensor]) -> Self:
-        """Inverse of iterating: a state like this one holding `tensors` instead"""
-        it = iter(tensors)
-        return self.apply(lambda _: next(it))
-
-    def step(self, t: int, grads: dict[str, Tensor]) -> Self:
-        """The state after step `t` with the gradients `grads`"""
-        raise NotImplementedError
-
-    def precond(self, t: int) -> Mapping[str, Tensor | float]:
-        """Per-element step size P of step `t` (the update is P * grad, or P * m for Adam): lr(t) for SGD."""
-        return {k: self.lr(t) for k in self.params}
-
-    @property
-    def stability_threshold(self) -> float:
-        """The EoS condition is `max_eig(sqrt(P) H sqrt(P)) = stability_threshold`"""
-        raise NotImplementedError
-
-
-@dataclass(kw_only=True)
-class SGDState(OptimState):
-    def step(self, t: int, grads: dict[str, Tensor]) -> Self:
-        P = self.precond(t)
-        return replace(self, params={
-            k: p - P[k] * (g + self.weight_decay * p)
-            for k, (p, g) in dict_zip(self.params, grads).items()
-        })
-
-    @property
-    def stability_threshold(self) -> float:
-        return 2.0
-
-
-@dataclass(kw_only=True)
-class SGDMomentumState(SGDState):
-    groups = ("params", "buffer")
-    momentum: float = 0.9
-    buffer: dict[str, Tensor] | None = None  # None -> zeros
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.buffer is None:
-            self.buffer = {k: torch.zeros_like(p) for k, p in self.params.items()}
-
-    def step(self, t: int, grads: dict[str, Tensor]) -> Self:
-        assert self.buffer is not None
-        P = self.precond(t)
-        buffer = {
-            k: self.momentum * buf + g + self.weight_decay * p
-            for k, (p, buf, g) in dict_zip(self.params, self.buffer, grads).items()
-        }
-        params = {k: p - P[k] * buf for k, (p, buf) in dict_zip(self.params, buffer).items()}
-        return replace(self, params=params, buffer=buffer)
-
-    @property
-    def stability_threshold(self) -> float:
-        return 2 * (1 + self.momentum)
-
-
-@dataclass(kw_only=True)
-class AdamState(OptimState):
-    """Adam as in torch.optim.Adam (L2 weight decay), with the μP learning rates `lrs`."""
-
-    groups = ("params", "m", "v")
-    lr_mults: dict[str, float] | None = None  # per-tensor multipliers of lr (None: μP, 1/sqrt(numel): a step moves each raw
-    # tensor by O(lr) in operator norm like SGD)
-    betas: tuple[float, float] = (0.9, 0.999)
-    eps: float = 1e-8
-    m: dict[str, Tensor] | None = None  # None -> zeros
-    v: dict[str, Tensor] | None = None
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.lr_mults is None:
-            self.lr_mults = {k: p.numel() ** -0.5 for k, p in self.params.items()}
-        if self.m is None:
-            self.m = {k: torch.zeros_like(p) for k, p in self.params.items()}
-        if self.v is None:
-            self.v = {k: torch.zeros_like(p) for k, p in self.params.items()}
-
-    def _step_sizes(self, v: dict[str, Tensor], t: int) -> dict[str, Tensor]:
-        """Per-element step size of step t (the (t + 1)-th, for the bias correction, training from step 0):
-        lr(t) * lr_mults / (bias-corrected sqrt(v) + eps)."""
-        assert self.lr_mults is not None
-        b1, b2, n, lr = *self.betas, t + 1, self.lr(t)
-        return {
-            k: lr * self.lr_mults[k] / (1 - b1**n) / (v_k**0.5 / (1 - b2**n) ** 0.5 + self.eps)
-            for k, v_k in v.items()
-        }
-
-    def step(self, t: int, grads: dict[str, Tensor]) -> Self:
-        assert self.m is not None and self.v is not None
-        b1, b2 = self.betas
-        grads = {k: g + self.weight_decay * p for k, (g, p) in dict_zip(grads, self.params).items()}
-        new_m = {k: b1 * m + (1 - b1) * g for k, (m, g) in dict_zip(self.m, grads).items()}
-        new_v = {k: b2 * v + (1 - b2) * g * g for k, (v, g) in dict_zip(self.v, grads).items()}
-        sizes = self._step_sizes(new_v, t)
-        params = {k: p - size * m for k, (p, m, size) in dict_zip(self.params, new_m, sizes).items()}
-        return replace(self, params=params, m=new_m, v=new_v)
-
-    def precond(self, t: int) -> dict[str, Tensor]:
-        """With this state's v (exact on the state after step t)."""
-        assert self.v is not None
-        return self._step_sizes(self.v, t)
-
-    @property
-    def stability_threshold(self) -> float:
-        """Cohen et al. 2022, "Adaptive gradient methods at the edge of stability": 38 for beta1 = 0.9."""
-        return 2 * (1 + self.betas[0]) / (1 - self.betas[0])

@@ -1,17 +1,37 @@
-"""The model's losses and metrics, and their derivatives: `eval_loss` (over many examples) and `hvp_fn` (Hessian-vector products)."""
+"""The model call, losses and metrics, and Hessian-vector products from gradients."""
 
-from typing import Callable
+from typing import Callable, Mapping, Protocol
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.func import grad_and_value, functional_call
-
-from src.data import Loader
-from src.eigvals import HVP
+from torch.func import functional_call
 
 
 LossFn = Callable[[Tensor, Tensor], Tensor]  # (model output [B, C], int labels [B]) -> per-example losses [B]
+
+
+class HVP(Protocol):
+    """V {name: [m, *shape]} -> H V (batched over the leading dim m), or a single vector {name: [*shape]} -> H v;
+    `create_graph=True` for a differentiable H V"""
+    def __call__(self, V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]: ...
+
+
+def hvp_from_grads(grads: dict[str, Tensor], params: dict[str, Tensor]) -> HVP:
+    """V -> H V = d(grads . V) / d params by stateful 2nd-order autograd: `grads` computed with create_graph at the leaves `params`"""
+    def hvp_fn(V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]:
+        batched = next(iter(V.values())).ndim > next(iter(params.values())).ndim
+        return torch.autograd.grad(
+            list(grads.values()), params, [V[k] for k in grads],
+            retain_graph=True, create_graph=create_graph, is_grads_batched=batched,
+        )
+    return hvp_fn
+
+
+def dict_zip[T](*dicts: Mapping[str, T]) -> dict[str, tuple[T, ...]]:
+    """e.g. {"a": 1, "b": 2}, {"a": 3, "b": 4} -> {"a": (1, 3), "b": (2, 4)}"""
+    assert all(set(dicts[0]) == set(d) for d in dicts)
+    return {key: tuple(d[key] for d in dicts) for key in dicts[0]}
 
 
 def cross_entropy(out: Tensor, Y: Tensor) -> Tensor:
@@ -38,51 +58,3 @@ def model_call(model: nn.Module, params: dict[str, Tensor], X: Tensor, *, bf16: 
     with torch.autocast(X.device.type, torch.bfloat16, enabled=bf16):
         out: Tensor = functional_call(model, params, (X,))
     return out.to(X.dtype)
-
-
-def eval_loss(
-    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor], loader: Loader, indices: Tensor,
-    *, grad: bool = False, bf16: bool = False,
-) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
-    """Mean loss of `params` over the examples `indices` of `loader`, accumulated batch by batch to bound the memory.
-    Returns: (loss, {metric: mean value}, {param: d loss / d param} if `grad` else {})."""
-    n = len(indices)
-
-    def batch_loss(params: dict[str, Tensor], X: Tensor, Y: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
-        """This batch's share of the mean loss, and of the mean metrics."""
-        out = model_call(model, params, X, bf16=bf16)
-        return loss_fn(out, Y).sum() / n, {k: v.sum() / n for k, v in metrics(out, Y).items()}
-
-    params = {k: p.detach() for k, p in params.items()}
-    loss, mean_metrics = torch.zeros((), device=loader.device), {}
-    grads = {k: torch.zeros_like(p) for k, p in params.items()} if grad else {}
-    for X, Y in loader.iter_batches(indices):
-        if grad:
-            d_params, (term, batch_metrics) = grad_and_value(batch_loss, has_aux=True)(params, X, Y)
-            grads = {k: grads[k] + d_params[k] for k in grads}
-        else:
-            term, batch_metrics = batch_loss(params, X, Y)
-        loss += term.detach()
-        for k, v in batch_metrics.items():
-            mean_metrics[k] = mean_metrics.get(k, 0) + v.detach()
-    return loss, mean_metrics, grads
-
-
-def hvp_fn(
-    model: nn.Module, loss_fn: LossFn, params: dict[str, Tensor], X: Tensor, Y: Tensor,
-    *, grads: dict[str, Tensor] | None = None, bf16: bool = False,
-) -> HVP:
-    """Build the V -> HV function (V with a leading batch dim) of the mean loss on (X, Y) using stateful 2nd-order autograd,
-    from `grads` if they were already computed with `create_graph` at the leaves `params` (as yielded by `Magic.train.trace`)."""
-    if grads is None:
-        params = {k: p.detach().requires_grad_() for k, p in params.items()}
-        out = model_call(model, params, X, bf16=bf16)
-        grads = torch.autograd.grad(loss_fn(out, Y).mean(), params, create_graph=True)
-
-    def hvp(V: dict[str, Tensor]) -> dict[str, Tensor]:
-        return torch.autograd.grad(
-            list(grads.values()), params, [V[k] for k in grads],
-            retain_graph=True, is_grads_batched=True,
-        )
-
-    return hvp

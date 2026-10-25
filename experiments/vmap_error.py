@@ -29,7 +29,6 @@ import torch
 
 from main import DTYPES, Experiment
 from src.logging import op_norm
-from src.utils import eval_loss
 
 
 def vmap_error(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
@@ -56,7 +55,7 @@ def vmap_error(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
             runs[dtype][name] = [s.apply(lambda t: t[0]) for s in states] if name == "vmap" else states
             res["peak_gpu_mb"][name] = torch.cuda.max_memory_allocated() / 2**20 if device.startswith("cuda") else float("nan")
             res["test_loss"][name] = [
-                eval_loss(exp.model, exp.loss_fn, {k: p.to(device) for k, p in s.params.items()}, exp.test_loader, test_idx, bf16=exp.bf16)[0].item()
+                exp.magic.eval_loss({k: p.to(device) for k, p in s.params.items()}, exp.test_loader, test_idx)[0].item()
                 for s in runs[dtype][name]
             ]
             click.echo(f"{dtype} {name:5s} test loss {res['test_loss'][name][-1]:.6f}  peak GPU {res['peak_gpu_mb'][name]:.0f} MB")

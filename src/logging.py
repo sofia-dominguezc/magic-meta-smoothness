@@ -25,11 +25,11 @@ def op_norm(t: Tensor, u: Tensor | None = None, n_iter: int = 3) -> tuple[Tensor
     r = torch.randn(M.shape[0], generator=torch.Generator().manual_seed(0)).to(M)
     u = r if u is None else torch.where(u.norm() > 0, u, r)  # a zero `u` (from a zero tensor) would stay zero
     eps = torch.finfo(M.dtype).tiny  # F.normalize's default 1e-12 breaks the iteration on tensors of norm < 1e-12
-    for _ in range(n_iter):
-        v = F.normalize(M.T @ u, dim=0, eps=eps)
-        Mv = M @ v
+    Mv = M @ F.normalize(M.T @ u, dim=0, eps=eps)
+    for _ in range(n_iter - 1):
         u = F.normalize(Mv, dim=0, eps=eps)
-    return Mv.norm(), u
+        Mv = M @ F.normalize(M.T @ u, dim=0, eps=eps)
+    return Mv.norm(), F.normalize(Mv, dim=0, eps=eps)
 
 
 class Logger:

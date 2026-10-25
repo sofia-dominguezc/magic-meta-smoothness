@@ -39,9 +39,8 @@ from scipy.spatial.distance import squareform
 from torch import Tensor
 
 from main import Experiment
-from src.eigvals import hessian_eigs
-from src.utils import hvp_fn, model_call
-from src.models import dict_zip
+from src.lobpcg import hessian_eigs
+from src.utils import dict_zip
 
 
 def spec_norms(D: Tensor) -> Tensor:
@@ -78,7 +77,7 @@ def run(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int, d
     rows = ["center", *map(str, range(1, n + 1)), "ref"]
     test_idx = exp.test_ds.subset(n_test)
     X, Y = (x.to(exp.device) for x in exp.test_ds.examples(test_idx))
-    example_losses = torch.func.vmap(lambda p: exp.loss_fn(model_call(exp.model, p, X, bf16=exp.bf16), Y))  # batched params -> [R, n_test]
+    example_losses = torch.func.vmap(lambda p: exp.magic.forward(p, X, Y)[0])  # batched params -> [R, n_test]
 
     click.echo(f"training the reference and {n + 1} models (vmapped) for {steps} steps from step {cfg.start}")
     dists, losses, traj_steps, disps = [], [], [], []  # per step: [n + 1] (ref last), [n + 2]; every traj_every steps: [n + 1, P]
@@ -112,11 +111,11 @@ def run(exp: Experiment, out_dir: Path, n_models: int, eps: float, steps: int, d
     # the directions vs. the Hessian at the start state
     X0, Y0, _ = magic.loader.get_batch(cfg.start)
     params0 = {k: p.to(magic.device) for k, p in start_state.params.items()}
-    hvp = hvp_fn(exp.model, exp.loss_fn, params0, X0, Y0, bf16=exp.bf16)  # V -> H V on batched params dicts
+    hvp_fn = exp.magic.hvp_fn(params0, X0, Y0)  # V -> H V on batched params dicts
     eig_names, eigvecs, eigvals, g = [], [], [], torch.Generator().manual_seed(0)
     for sign in [1, -1]:
         start = {k: torch.randn(n_eigs, *p.shape, generator=g, dtype=p.dtype).to(p.device) for k, p in params0.items()}
-        vals, vecs, _ = hessian_eigs(hvp, start, start_state.precond(cfg.start), sign)
+        vals, vecs, _ = hessian_eigs(hvp_fn, start, start_state.precond(cfg.start), sign)
         eig_names += [f"eig {'-' if sign < 0 else ''}{i + 1}" for i in range(n_eigs)]
         eigvecs.append(flat(vecs).T.double().cpu())  # [P, n_eigs]
         eigvals += (vals.detach().cpu() * (2 / start_state.stability_threshold)).tolist()

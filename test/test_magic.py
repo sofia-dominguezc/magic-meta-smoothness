@@ -5,10 +5,11 @@ import torch
 from torch.func import functional_call
 
 from src.data import Dataset, Loader, Majority
-from src.eigvals import hessian_eigs
+from src.lobpcg import hessian_eigs
 from src.magic import Magic
-from src.utils import cross_entropy, hvp_fn
-from src.models import MLP, AdamState, Linear, LRSchedule, ResNet, SGDMomentumState, SGDState, ViT
+from src.utils import cross_entropy, hvp_from_grads
+from src.models import MLP, Linear, ResNet, ViT
+from src.optimizers import AdamState, LRSchedule, NewtonState, SGDMomentumState, SGDState, SharpnessState
 from src.logging import Logger, op_norm
 from train_logged import train_logged
 
@@ -20,11 +21,15 @@ def setup(optimizer: str, **kwargs):
     model = MLP((8,), 2, width=16, depth=1).to(torch.get_default_dtype())
     params = {k: p.detach().clone() for k, p in model.named_parameters()}
     if optimizer == "sgd":
-        state = SGDState(params=params, lr=LRSchedule(0.1), weight_decay=0.01)
+        state = SGDState(params=params, lr=LRSchedule(0.1), wd=0.01)
     elif optimizer == "momentum":
-        state = SGDMomentumState(params=params, lr=LRSchedule(0.1), weight_decay=0.01, momentum=0.9)
+        state = SGDMomentumState(params=params, lr=LRSchedule(0.1), wd=0.01, momentum=0.9)
+    elif optimizer == "sharpness":
+        state = SharpnessState(params=params, lr=LRSchedule(1.0), wd=0.01)
+    elif optimizer == "newton":  # rtol: the implicit backward is compared with the unrolled one (equal up to it)
+        state = NewtonState(params=params, lr=LRSchedule(1.0), wd=0.01, damping=1.0, rtol=1e-10)
     else:
-        state = AdamState(params=params, lr=LRSchedule(0.01), weight_decay=0.01)
+        state = AdamState(params=params, lr=LRSchedule(0.01), wd=0.01)
     magic = Magic(model=model, loader=Loader(train_ds, batch_size=8, seed=3), loss_fn=cross_entropy, **kwargs)
     return magic, train_ds, Loader(test_ds, batch_size=7), state  # eval sets of several batches
 
@@ -42,12 +47,13 @@ def test_replay_reconstructs_training(n_steps, passes):
             assert torch.equal(x, y)
 
 
-@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam"])
+@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam", "sharpness"])
 def test_magic_matches_autograd_through_training(optimizer, float64):
-    """MAGIC's df/dw must equal autograd through the whole unrolled training."""
+    """MAGIC's df/dw must equal autograd through the whole unrolled training (for the sharpness step: through the
+    Rayleigh quotient of the detached eigenvector, the same expression)."""
     magic, train_ds, test_loader, state = setup(optimizer)
-    n_steps, eval_sets = 11, {"a": torch.arange(10), "b": torch.arange(20, 50)}
-    outputs, betas = magic.backprop(state, n_steps=n_steps, test_loader=test_loader, eval_sets=eval_sets)
+    n_steps, eval_sets = 11, [torch.arange(10), torch.arange(20, 50)]
+    outputs, betas = magic.backprop(state, n_steps=n_steps, eval_sets=[test_loader.dataset.examples(idx) for idx in eval_sets])
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -55,7 +61,7 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
         X, Y, idx = magic.loader.get_batch(t)
         loss = (w[idx] * cross_entropy(functional_call(magic.model, s.params, (X,)), Y)).mean()
         s = s.step(t, torch.autograd.grad(loss, s.params, create_graph=True))
-    for k, idx in eval_sets.items():
+    for k, idx in enumerate(eval_sets):
         X, Y = test_loader.dataset.examples(idx)
         f = cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean()
         (expected,) = torch.autograd.grad(f, w, retain_graph=True)
@@ -92,7 +98,7 @@ def test_lr_schedule(optimizer, float64):
     assert lrs[0] == lr / 2 and lrs[1] == lrs[2] == lr and lr > lrs[3] > lrs[4] > lrs[5] == pytest.approx(LRSchedule.FINAL_FRACTION * lr)
     assert type(state)(**asdict(state)).lr == state.lr  # survives a save
     final = magic.train(state, n_steps=n_steps)
-    outputs, betas = magic.backprop(state, n_steps=n_steps, test_loader=test_loader, eval_sets={"a": torch.arange(10)})
+    outputs, betas = magic.backprop(state, n_steps=n_steps, eval_sets=[test_loader.dataset.examples(torch.arange(10))])
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -104,7 +110,7 @@ def test_lr_schedule(optimizer, float64):
         torch.testing.assert_close(a, b.detach())
     X, Y = test_loader.dataset.examples(torch.arange(10))
     f = cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean()
-    torch.testing.assert_close(betas["a"], torch.autograd.grad(f, w)[0])
+    torch.testing.assert_close(betas[0], torch.autograd.grad(f, w)[0])
 
 
 def test_train_yields_grads_and_graph(float64):
@@ -120,12 +126,12 @@ def test_train_yields_grads_and_graph(float64):
         expected = torch.autograd.grad(cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean(), s.params)
         torch.testing.assert_close(grads, expected)
         V = {k: torch.randn(2, *p.shape) for k, p in s.params.items()}
-        torch.testing.assert_close(hvp_fn(magic.model, cross_entropy, s.params, X, Y, grads=grads)(V), hvp_fn(magic.model, cross_entropy, s.params, X, Y)(V))
+        torch.testing.assert_close(hvp_from_grads(grads, s.params)(V), magic.hvp_fn(s.params, X, Y)(V))
         v = {k: V_k[0] for k, V_k in V.items()}
         new = s.step(t, grads)
         jtv = torch.autograd.grad(list(new), list(s), list(v.values()), retain_graph=True)
-        Hv = hvp_fn(magic.model, cross_entropy, s.params, X, Y, grads=grads)({k: V_k[:1] for k, V_k in V.items()})
-        lr, wd = s.lr(t), s.weight_decay
+        Hv = hvp_from_grads(grads, s.params)({k: V_k[:1] for k, V_k in V.items()})
+        lr, wd = s.lr(t), s.wd
         for a, (k, v_k) in zip(jtv, v.items()):
             torch.testing.assert_close(a, v_k - lr * (Hv[k][0] + wd * v_k))
     for _, s, _ in magic.train.trace(state, n_steps=2):
@@ -156,10 +162,34 @@ def test_tangent_matches_finite_differences(float64):
         torch.testing.assert_close(logger._history[k][0][1], ref._history[k][0][1], rtol=1e-5, atol=1e-8)
 
 
+def test_sharpness_state(float64):
+    """The sharpness step moves by lr * 2 / (top eigenvalue of the dense Hessian) and saves that eigenvalue; its aux groups
+    are no MAGIC state."""
+    magic, _, _, state = setup("sharpness")
+    assert state.groups == ("params",) and state.aux == ("eigvec", "stats")
+    assert len(list(state)) == len(state.params) and state.precond(0)["out.weight"] == 0
+    sizes = [p.numel() for p in state.params.values()]
+    for t, s, grads in magic.train.trace(state, n_steps=3):
+        if grads is None:
+            break
+        X, Y, _ = magic.loader.get_batch(t)
+
+        def loss(flat):
+            unflat = {k: v.view_as(p) for (k, p), v in zip(s.params.items(), flat.split(sizes))}
+            return cross_entropy(functional_call(magic.model, unflat, (X,)), Y).mean()
+
+        top = torch.linalg.eigvalsh(torch.func.hessian(loss)(torch.cat([p.detach().flatten() for p in s.params.values()])))[-1]
+        new = s.step(t, grads)
+        torch.testing.assert_close(new.stats["sharpness"], top, rtol=1e-3, atol=0)
+        for (k, p), g in zip(s.params.items(), grads.values()):
+            torch.testing.assert_close(new.params[k], p - 2.0 / top * (g + 0.01 * p), rtol=1e-3, atol=1e-4)  # (LOBPCG rtol)
+        assert new.eigvec["out.weight"].shape == s.params["out.weight"].shape and not new.eigvec["out.weight"].requires_grad
+
+
 def test_magic_does_not_modify_init_state():
     """On CPU `.to()` doesn't copy, so the replayed s_0 shares tensors with `init_state`."""
     magic, _, test_loader, state = setup("momentum")
-    magic.backprop(state, n_steps=4, test_loader=test_loader, eval_sets={"a": torch.arange(10)})
+    magic.backprop(state, n_steps=4, eval_sets=[test_loader.dataset.examples(torch.arange(10))])
     assert not any(t.requires_grad for t in state)
 
 
@@ -187,10 +217,10 @@ def test_top_hessian_eigs_match_dense(precond, negative, float64):
     expected = all_eigs[:3] if negative else all_eigs.flip(0)[:3]
     assert (expected < 0).all() if negative else (expected > 0).all()  # the Hessian is indefinite: both signs tested
 
-    hvp = hvp_fn(magic.model, cross_entropy, params, X, Y)  # V -> H V on batched params dicts
+    hvp_fn = magic.hvp_fn(params, X, Y)  # V -> H V on batched params dicts
     start = {k: torch.randn(3, *p.shape, generator=g, dtype=p.dtype) for k, p in params.items()}
-    eigvals, eigvecs, n_iter = hessian_eigs(hvp, start, P, sign=-1 if negative else 1)
-    eigvals, _, _ = hessian_eigs(hvp, eigvecs, P, sign=-1 if negative else 1)  # warm-started, like the logging
+    eigvals, eigvecs, n_iter = hessian_eigs(hvp_fn, start, P, sign=-1 if negative else 1)
+    eigvals, _, _ = hessian_eigs(hvp_fn, eigvecs, P, sign=-1 if negative else 1)  # warm-started, like the logging
     assert 0 < n_iter and sum(sizes) >= 12  # LOBPCG ran (no dense fallback)
     torch.testing.assert_close(eigvals, expected, rtol=1e-2, atol=0)
 
@@ -233,7 +263,7 @@ def test_dataset_take():
 
 def test_momentum_matches_torch_optim():
     params = {"a": torch.randn(5), "b": torch.randn(3, 2)}
-    state = SGDMomentumState(params=params, lr=LRSchedule(0.1), weight_decay=0.01, momentum=0.9)
+    state = SGDMomentumState(params=params, lr=LRSchedule(0.1), wd=0.01, momentum=0.9)
     torch_params = [p.clone().requires_grad_() for p in params.values()]
     opt = torch.optim.SGD(torch_params, lr=0.1, weight_decay=0.01, momentum=0.9)
     for t in range(3):
@@ -248,7 +278,7 @@ def test_momentum_matches_torch_optim():
 
 def test_adam_matches_torch_optim():
     params = {"a": torch.randn(5), "b": torch.randn(3, 2)}
-    state = AdamState(params=params, lr=LRSchedule(0.1), weight_decay=0.01, betas=(0.8, 0.99))
+    state = AdamState(params=params, lr=LRSchedule(0.1), wd=0.01, betas=(0.8, 0.99))
     torch_params = [p.clone().requires_grad_() for p in params.values()]
     groups = [{"params": [p], "lr": 0.1 * p.numel() ** -0.5} for p in torch_params]  # the muP lrs
     opt = torch.optim.Adam(groups, weight_decay=0.01, betas=(0.8, 0.99))
@@ -275,7 +305,7 @@ class Noise(Dataset):
         return self.X[idx], self.labels[idx]
 
 
-@pytest.mark.parametrize("model_cls, kwargs", [(ResNet, dict(width=4)), (ViT, dict(dim=8, head_dim=4, depth=1))])
+@pytest.mark.parametrize("model_cls, kwargs", [(ResNet, dict(width=4)), (ViT, dict(width=8, head_dim=4, depth=1))])
 def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     """Double backward (through the loss and the step) and LOBPCG (needed for the logged metrics and MAGIC) work through the models."""
     train_ds, test_ds = Noise((3, 8, 8)), Noise((3, 8, 8), seed=1)
@@ -285,15 +315,16 @@ def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     logger = Logger(name="test")
     magic, test_loader = Magic(model=model, loader=Loader(train_ds, batch_size=4), loss_fn=cross_entropy), Loader(test_ds)
     train_logged(magic, state, n_steps=3, test_loader=test_loader, logger=logger, eval_every=2, n_top_eigs=2, eig_every=2)
-    outputs, betas = magic.backprop(state, n_steps=3, test_loader=test_loader, eval_sets={"f": torch.arange(8)}, log=logger)
-    for t, _, delta, d_weights in magic.backprop.trace(state, n_steps=3, test_loader=test_loader, eval_sets={"f": torch.arange(8)}):
+    eval_sets = [test_loader.dataset.examples(torch.arange(8))]
+    outputs, betas = magic.backprop(state, n_steps=3, eval_sets=eval_sets, log=logger)
+    for t, _, delta, d_weights in magic.backprop.trace(state, n_steps=3, eval_sets=eval_sets):
         assert d_weights.shape == (1, 4)
     logger.finish(tmp_path / "metrics.pt")
     metrics = torch.load(tmp_path / "metrics.pt", weights_only=True)
     assert all(torch.isfinite(m["value"]).all() for m in metrics.values())
     assert {"loss", "acc", "loss/ema", "test_acc/ema", "eig/1", "eig/2", "tangent_eig/2", "ema_eig/1", "test_loss", "params/out.weight",
-            "grads/out.bias", "tangent/params/out.weight", "delta/f/params/out.weight", "d_weights/f"} <= set(metrics)
-    assert torch.isfinite(betas["f"]).all() and (betas["f"] != 0).any()
+            "grads/out.bias", "tangent/params/out.weight", "delta/0/params/out.weight", "d_weights/0"} <= set(metrics)
+    assert betas.shape == (1, len(train_ds)) and torch.isfinite(betas).all() and (betas != 0).any()
     assert (tmp_path / "metrics.png").exists() and (tmp_path / "metrics_norms.png").exists()
 
 

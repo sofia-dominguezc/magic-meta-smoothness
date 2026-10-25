@@ -10,7 +10,7 @@ from train_logged import main as train_logged
 
 
 def test_cli_end_to_end(tmp_path):
-    """new -> tune_lr -> train (twice: two alphas) -> train_logged -> magic -> evaluate on a tiny CPU config, with momentum.
+    """new -> tune_lr -> train (twice) -> train_logged -> magic -> evaluate on a tiny CPU config, with momentum.
     MAGIC's predictions should agree with the retrained models (in float64: the loss changes are tiny)."""
     d = str(tmp_path)
     runner = CliRunner()
@@ -19,9 +19,9 @@ def test_cli_end_to_end(tmp_path):
     assert tune_lr(tmp_path, lrs=[0.05, 0.1], steps=6, show=False) in (0.05, 0.1)
     assert json.loads((tmp_path / "config.json").read_text())["lr"] in (0.05, 0.1)
     for args in [
-        ["train", d, "--alpha", "0.025", "--n-subsets", "4", "--vmap-limit", "3", "--no-show"],  # the full model + 4 models in 2 chunks
-        ["train", d, "--alpha", "0.05", "--n-subsets", "2", "--no-show"],
-        ["magic", d, "--n-test", "5", "--n-subsets", "2", "--no-show"],
+        ["train", d, "--kind", "drop", "--alpha", "0.025", "--alpha", "0.05", "--n-subsets", "2", "--vmap-limit", "3", "--no-show"],  # the full model + 4 models in 2 chunks
+        ["train", d, "--kind", "drop", "--alpha", "0.025", "--n-subsets", "4", "--no-show"],  # 2 new models
+        ["magic", d, "--n-test", "5", "--n-subsets", "2", "--vmap-limit", "1", "--no-show"],  # 2 eval sets in 2 chunks
         ["magic", d, "--n-test", "5", "--n-subsets", "3", "--no-show"],  # one new eval subset
         ["magic", d, "--n-test", "20", "--no-show"],  # another size (4 eval fns in all)
         ["magic", d, "--n-test", "5", "--no-show"],  # nothing new
@@ -45,7 +45,7 @@ def test_cli_end_to_end(tmp_path):
     assert "tangent/buffer/out.weight" not in logged  # momentum: no tangent
     assert len(logged["test_loss"]["step"]) == 4 and len(logged["eig/-1"]["step"]) == 6  # steps 0, 4, 8, 12 and 0, 2, ..., 10
     magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)  # of the last magic call that computed something
-    assert "delta/20 examples #0/buffer/out.weight" in magic_metrics and len(magic_metrics) == 2 * 6 + 1  # 1 subset: (params, buffer) x 6 tensors + d_weights
+    assert "delta/0/buffer/out.weight" in magic_metrics and len(magic_metrics) == 2 * 6 + 1  # 1 subset: (params, buffer) x 6 tensors + d_weights
     assert not (tmp_path / "retrained" / results["groups"][0]["runs"][0] / "metrics.pt").exists()  # retrained runs aren't logged
     for g in results["groups"]:
         assert g["pooled"]["ccc"] > 0.9 and g["pooled"]["cosine"] > 0.9
@@ -84,6 +84,30 @@ def test_start_and_randn(tmp_path):
     assert not (tmp_path / "evaluation" / "alpha.png").exists()  # a single (kind, alpha)
 
 
+def test_sharpness(tmp_path):
+    """The sharpness optimizer (SGD with the step size 2 / top Hessian eigenvalue, a second-order step with aux state) runs
+    through train (the full model only: not vmapped), magic and train_logged."""
+    d = str(tmp_path)
+    runner = CliRunner()
+    for args in [
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--optimizer", "sharpness", "--lr", "1", "--n-steps", "6", "--dtype", "fp64"],
+        ["train", d, "--n-subsets", "0", "--no-show"],
+        ["magic", d, "--n-test", "5", "--no-show"],
+    ]:
+        result = runner.invoke(main, args, catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+    result = runner.invoke(train_logged, [d, "--eval-every", "3", "--n-test", "20", "--no-show"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    final = torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)
+    assert set(final) == {"params", "lr", "weight_decay", "eigvec", "stats"} and torch.isfinite(final["stats"]["sharpness"])
+    lin = torch.load(tmp_path / "magic" / "5_examples_0" / "linearization.pt", weights_only=True)
+    assert torch.isfinite(lin["beta"]).all() and (lin["beta"] != 0).any()
+    logged = torch.load(tmp_path / "logged" / "metrics.pt", weights_only=True)
+    assert "tangent/params/out.weight" not in logged and torch.isfinite(logged["eig/1"]["value"][1:]).all()  # (eig/1 at step 0: P = 0)
+    magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)
+    assert not any(k.startswith("delta/5 examples #0/eigvec") for k in magic_metrics)  # no norms of the aux groups
+
+
 def test_bf16(tmp_path):
     """fp32 states with the model forward in bfloat16 run through logging (double backward, LOBPCG), MAGIC and the evaluation."""
     d = str(tmp_path)
@@ -104,3 +128,28 @@ def test_bf16(tmp_path):
     assert torch.isfinite(lin["beta"]).all() and (lin["beta"] != 0).any()
     results = evaluate(tmp_path, show=False)
     assert len(results["groups"][0]["runs"]) == 2
+
+
+def test_newton(tmp_path):
+    """The newton optimizer (damped Newton by MINRES: a second-order step with aux state and an implicit backward) runs
+    through train (the full model only: not vmapped), magic and train_logged."""
+    d = str(tmp_path)
+    runner = CliRunner()
+    for args in [
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--optimizer", "newton", "--lr", "1", "--damping", "2", "--n-steps", "6", "--dtype", "fp64"],
+        ["train", d, "--n-subsets", "0", "--no-show"],
+        ["magic", d, "--n-test", "5", "--no-show"],
+    ]:
+        result = runner.invoke(main, args, catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+    result = runner.invoke(train_logged, [d, "--eval-every", "3", "--n-test", "20", "--no-show"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    final = torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)
+    assert set(final) == {"params", "lr", "weight_decay", "damping", "rtol", "max_iter", "newton", "eigvec", "stats"}
+    assert final["damping"] == 2 and 0 < final["stats"]["iterations"] < 100 and torch.isfinite(final["stats"]["residual"])  # converged
+    lin = torch.load(tmp_path / "magic" / "5_examples_0" / "linearization.pt", weights_only=True)
+    assert torch.isfinite(lin["beta"]).all() and (lin["beta"] != 0).any()
+    logged = torch.load(tmp_path / "logged" / "metrics.pt", weights_only=True)
+    assert "tangent/params/out.weight" not in logged and torch.isfinite(logged["eig/1"]["value"]).all()
+    magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)
+    assert not any(k.startswith("delta/5 examples #0/newton") for k in magic_metrics)  # no norms of the aux groups

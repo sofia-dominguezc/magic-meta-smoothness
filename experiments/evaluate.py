@@ -27,7 +27,6 @@ import torch
 from tqdm import tqdm
 
 from main import Experiment
-from src.utils import eval_loss
 
 
 def natural(name: str) -> list:
@@ -159,7 +158,7 @@ def evaluate(exp_dir: Path, device: str = "cpu", show: bool = True) -> dict:
     def f(path: Path) -> torch.Tensor:
         """The eval fns on the state saved at `path`."""
         params = {k: t.to(device) for k, t in exp.load_state(path).params.items()}
-        return torch.stack([eval_loss(exp.model, exp.loss_fn, params, exp.test_loader, indices, bf16=exp.bf16)[0] for indices in eval_sets]).cpu()
+        return torch.stack([exp.magic.eval_loss(params, exp.test_loader, indices)[0] for indices in eval_sets]).cpu()
 
     preds, reals = [], []  # [n_fns] per run: the predicted and real change of the eval fns
     f_full = f(exp_dir / "full_model" / "final.pt")

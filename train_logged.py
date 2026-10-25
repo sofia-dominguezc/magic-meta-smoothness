@@ -25,10 +25,10 @@ from torch import Tensor
 from main import Experiment
 from src.data import Loader
 from src.logging import Logger, op_norm
-from src.eigvals import hessian_eigs
+from src.lobpcg import hessian_eigs
 from src.magic import Magic
-from src.utils import eval_loss, hvp_fn, metrics, model_call
-from src.models import OptimState, SGDState, dict_zip
+from src.utils import dict_zip, hvp_from_grads, metrics
+from src.optimizers import OptimState, SGDState
 
 
 def train_logged(
@@ -37,7 +37,6 @@ def train_logged(
     eval_every: int = 100, n_test: int | None = None, ema_decay: float | None = 0.9,
 ) -> OptimState:
     """Returns the trained state."""
-    model, loss_fn, bf16 = magic.model, magic.loss_fn, magic.bf16
     ks = {sign: k for sign, k in ((1, n_top_eigs), (-1, n_neg_eigs)) if k > 0}  # sign -> number of eigenpairs
     if tangent and type(init_state) is not SGDState:
         click.echo("no tangent: only an SGD step has a symmetric Jacobian")
@@ -69,24 +68,23 @@ def train_logged(
                 if ema is None:
                     ema = {k: p.clone() for k, p in params.items()}
                 else:
-                    for e, p in dict_zip(ema, params).values():
-                        e.lerp_(p, 1 - ema_decay)
-                out = model_call(model, ema, X, bf16=bf16)
-                batch_metrics = {"loss": loss_fn(out, Y).mean(), **{k: m.mean() for k, m in metrics(out, Y).items()}}
+                    ema = {k: e + (1 - ema_decay) * (p - e) for k, (e, p) in dict_zip(ema, params).items()}
+                losses, out = magic.forward(ema, X, Y)
+                batch_metrics = {"loss": losses.mean(), **{k: m.mean() for k, m in metrics(out, Y).items()}}
                 logger.log(t, **{f"{k}/ema": m for k, m in batch_metrics.items()})
 
         if v is not None:
             logger.log_norms(t, "tangent", v)
 
         if ks and grads is not None and (t - start) % eig_every == 0:
-            hvp, P = hvp_fn(model, loss_fn, state.params, X, Y, grads=grads, bf16=bf16), state.precond(t)
+            hvp_fn, P = hvp_from_grads(grads, state.params), state.precond(t)
             directions = {"tangent_eig": None if v is None else v.params,
                           "ema_eig": None if ema is None or t == start else {k: p - e for k, (p, e) in dict_zip(params, ema).items()}}
             for sign, k in ks.items():
                 if sign not in warm:  # random start
                     g = torch.Generator().manual_seed(t)
                     warm[sign] = {name: torch.randn(k, *p.shape, generator=g, dtype=p.dtype).to(p.device) for name, p in params.items()}
-                eigvals, warm[sign], n_iter = hessian_eigs(hvp, warm[sign], P, sign)
+                eigvals, warm[sign], n_iter = hessian_eigs(hvp_fn, warm[sign], P, sign)
                 ids = [sign * (i + 1) for i in range(k)]
                 logger.log(t, **{f"eig/{i}": lam for i, lam in zip(ids, eigvals.unbind())}, **{f"lobpcg_iters/{sign}": torch.tensor(n_iter)})
                 for j, i in enumerate(ids):
@@ -103,7 +101,7 @@ def train_logged(
             indices = torch.arange(len(test_ds)) if n_test is None or grads is None else test_ds.subset(n_test, index=t)
             for p, suffix in ((params, ""), (ema, "/ema")):
                 if p is not None:
-                    loss, mean_metrics, _ = eval_loss(model, loss_fn, p, test_loader, indices, bf16=bf16)
+                    loss, mean_metrics = magic.eval_loss(p, test_loader, indices)
                     logger.log(t, **{f"test_{k}{suffix}": m for k, m in {"loss": loss, **mean_metrics}.items()})
     return state.apply(lambda s: s.detach().cpu())
 
