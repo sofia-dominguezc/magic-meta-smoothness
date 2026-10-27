@@ -70,13 +70,13 @@ def test_start_and_randn(tmp_path):
     (tmp_path / "full_model" / "final.pt").unlink()
     result = runner.invoke(train_logged, [d, "--eval-every", "0", "--no-show"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
-    assert set(torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)) == {"params", "lr", "weight_decay"}  # re-saved by train_logged
+    assert set(torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)) == {"params", "lr", "wd"}  # re-saved by train_logged
     logged = torch.load(tmp_path / "logged" / "metrics.pt", weights_only=True)
     assert "tangent/params/out.weight" in logged and logged["loss"]["step"][0] == 6 and "test_loss" not in logged  # SGD: backward AD tangent
     pert = torch.load(tmp_path / "retrained" / "randn_0.01_2" / "perturbation.pt", weights_only=True)
     assert (tmp_path / "retrained" / "randn_0.01_2" / "final.pt").exists() and (pert["kind"], pert["alpha"]) == ("randn", 0.01)
     assert pert["weights"].shape == (512,) and not torch.equal(pert["weights"], torch.ones(512))
-    assert set(torch.load(tmp_path / "full_model" / "start.pt", weights_only=True)) == {"params", "lr", "weight_decay"}
+    assert set(torch.load(tmp_path / "full_model" / "start.pt", weights_only=True)) == {"params", "lr", "wd"}
     assert torch.load(tmp_path / "full_model" / "metrics.pt", weights_only=True)["loss"]["step"][0] == 6  # no log before `start`
     results = evaluate(tmp_path, show=False)
     assert [(g["kind"], g["alpha"], len(g["runs"])) for g in results["groups"]] == [("randn", 0.01, 3)]
@@ -99,11 +99,15 @@ def test_sharpness(tmp_path):
     result = runner.invoke(train_logged, [d, "--eval-every", "3", "--n-test", "20", "--no-show"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
     final = torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)
-    assert set(final) == {"params", "lr", "weight_decay", "eigvec", "stats"} and torch.isfinite(final["stats"]["sharpness"])
+    assert set(final) == {"params", "lr", "wd", "eigvec", "stats"} and torch.isfinite(final["stats"]["sharpness"])
     lin = torch.load(tmp_path / "magic" / "5_examples_0" / "linearization.pt", weights_only=True)
     assert torch.isfinite(lin["beta"]).all() and (lin["beta"] != 0).any()
+    full_metrics = torch.load(tmp_path / "full_model" / "metrics.pt", weights_only=True)
+    assert "eig_iters" in full_metrics and len(full_metrics["sharpness"]["step"]) == 6 and torch.isfinite(full_metrics["sharpness"]["value"]).all()  # the stats
     logged = torch.load(tmp_path / "logged" / "metrics.pt", weights_only=True)
-    assert "tangent/params/out.weight" not in logged and torch.isfinite(logged["eig/1"]["value"][1:]).all()  # (eig/1 at step 0: P = 0)
+    assert "tangent/params/out.weight" not in logged and "lobpcg_iters/1" not in logged  # the step's eigenpair, no LOBPCG
+    assert logged["eig/1"]["step"].tolist() == list(range(6)) and "eigvec/1/out.weight" in logged and "ema_eig/1" in logged
+    torch.testing.assert_close(logged["eig/1"]["value"], torch.full((6,), 2.0, dtype=torch.float64))  # lr 1: the step size * sharpness
     magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)
     assert not any(k.startswith("delta/5 examples #0/eigvec") for k in magic_metrics)  # no norms of the aux groups
 
@@ -142,14 +146,17 @@ def test_newton(tmp_path):
     ]:
         result = runner.invoke(main, args, catch_exceptions=False)
         assert result.exit_code == 0, result.output
-    result = runner.invoke(train_logged, [d, "--eval-every", "3", "--n-test", "20", "--no-show"], catch_exceptions=False)
+    result = runner.invoke(train_logged, [d, "--eig-every", "2", "--eval-every", "3", "--n-test", "20", "--no-show"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
     final = torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)
-    assert set(final) == {"params", "lr", "weight_decay", "damping", "rtol", "max_iter", "newton", "eigvec", "stats"}
-    assert final["damping"] == 2 and 0 < final["stats"]["iterations"] < 100 and torch.isfinite(final["stats"]["residual"])  # converged
+    assert set(final) == {"params", "lr", "wd", "damping", "rtol", "newton", "eigvec", "stats"}
+    assert final["damping"] == 2 and 0 < final["stats"]["newton_iters"] < 100 and torch.isfinite(final["stats"]["residual"])  # converged
     lin = torch.load(tmp_path / "magic" / "5_examples_0" / "linearization.pt", weights_only=True)
     assert torch.isfinite(lin["beta"]).all() and (lin["beta"] != 0).any()
     logged = torch.load(tmp_path / "logged" / "metrics.pt", weights_only=True)
+    assert {"newton_iters", "eig_iters", "residual", "min_eig"} <= set(logged) and len(logged["min_eig"]["step"]) == 6  # the stats
     assert "tangent/params/out.weight" not in logged and torch.isfinite(logged["eig/1"]["value"]).all()
+    assert logged["eig/1"]["step"].tolist() == [2, 4] and logged["eig/-1"]["step"].tolist() == list(range(6))  # LOBPCG from t > start; the step's own min eig
+    torch.testing.assert_close(logged["eig/-1"]["value"], logged["min_eig"]["value"] / ((-2 * logged["min_eig"]["value"]).clamp_min(0) + 2))  # lr 1, damping 2: step size * min eig
     magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)
     assert not any(k.startswith("delta/5 examples #0/newton") for k in magic_metrics)  # no norms of the aux groups

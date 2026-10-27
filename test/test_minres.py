@@ -91,7 +91,7 @@ def newton_step_unrolled(s, t: int, grads: dict[str, torch.Tensor]):
     shift = (-2 * min_eig).clamp_min(0) + s.damping
     rhs = flatten({k: g + s.wd * p for k, (p, g) in dict_zip(s.params, grads).items()}, batched=False)
     A = lambda V: flatten(hvp_fn(unflatten(V, shapes), create_graph=True))
-    X, _, _ = minres(A, rhs, shift=shift, rtol=s.rtol, max_iter=s.max_iter, x0=flatten(s.newton, batched=False))
+    X, _, _ = minres(A, rhs, shift=shift, rtol=s.rtol, x0=flatten(s.newton, batched=False))
     x = unflatten(X, shapes)
     params = {k: p - s.lr(t) * x_k for k, (p, x_k) in dict_zip(s.params, x).items()}
     return replace(s, params=params, newton={k: x_k.detach() for k, x_k in x.items()}, eigvec=v)  # the same warm starts as `step`
@@ -118,12 +118,12 @@ def test_newton_state(float64):
     rhs = torch.cat([(g + 0.01 * p).detach().flatten() for p, g in dict_zip(s.params, grads).values()])
     new = s.step(0, grads)
     min_eig = torch.linalg.eigvalsh(H)[0]
-    assert min_eig < 0 and new.stats["shift"] > state.damping  # the shift is active: the Rayleigh term of `vjp` is tested
-    torch.testing.assert_close(new.stats["min_eig"], min_eig, rtol=1e-2, atol=0)  # (LOBPCG rtol)
-    x = torch.linalg.solve(H + new.stats["shift"] * torch.eye(len(rhs)), rhs)
+    assert min_eig < 0 and state._shift(new.stats["min_eig"]) > state.damping  # the shift is active: the Rayleigh term of `vjp` is tested
+    torch.testing.assert_close(new.stats["min_eig"], min_eig, rtol=0.1, atol=0)  # (LOBPCG rtol, from a random start)
+    x = torch.linalg.solve(H + state._shift(new.stats["min_eig"]) * torch.eye(len(rhs)), rhs)
     torch.testing.assert_close(torch.cat([(p - n).flatten() for p, n in dict_zip(s.params, new.params).values()]), x, rtol=1e-7, atol=1e-9)
     torch.testing.assert_close(torch.cat([v.flatten() for v in new.newton.values()]), x, rtol=1e-7, atol=1e-9)
-    assert 0 < new.stats["iterations"] < len(rhs) and new.stats["residual"] <= 1e-10 * rhs.norm()
+    assert 0 < new.stats["newton_iters"] < len(rhs) and new.stats["residual"] <= 1e-10 * rhs.norm()
     assert not new.newton["out.weight"].requires_grad and new.newton["out.weight"].shape == s.params["out.weight"].shape
     assert not s.newton["out.weight"].requires_grad and s.params["out.weight"].requires_grad  # `apply` keeps the aux detached
 

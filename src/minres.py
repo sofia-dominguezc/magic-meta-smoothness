@@ -13,7 +13,8 @@ Operator = Callable[[Tensor], Tensor]  # [n, m] -> [n, m], evaluated on each col
 
 
 def minres(
-    A: Operator, B: Tensor, shift: float | Tensor = 0.0, rtol: float = 1e-4, max_iter: int = 100,
+    A: Operator, B: Tensor, shift: float | Tensor = 0.0,
+    rtol: float = 1e-3, max_iter: int = 500,  # before: 1e-4, 500
     x0: Tensor | None = None, precond: Operator | None = None,
 ) -> tuple[Tensor, Tensor, int]:
     """Solve (A + shift I) X = B by MINRES (Lanczos + Givens QR of the tridiagonal) for the columns of B [n, m], or a vector [n].

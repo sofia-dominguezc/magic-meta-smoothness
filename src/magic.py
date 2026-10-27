@@ -9,7 +9,7 @@ from torch import Tensor, nn
 
 from src.data import Loader
 from src.logging import Logger
-from src.optimizers import OptimState
+from src.optimizers import OptimState, SecondOrderState
 from src.utils import HVP, LossFn, hvp_from_grads, metrics, model_call
 
 Forward = Callable[[dict[str, Tensor], Tensor, Tensor], tuple[Tensor, Tensor]]  # (params, X, Y) -> (per-example losses, outputs)
@@ -84,8 +84,8 @@ class Magic:
         return hvp_from_grads(grads, params)
 
     def _setup_forward(self, state: OptimState, weights: Tensor | None) -> tuple[Forward, OptimState, bool]:
-        """`forward` vmapped if the state or the weights are batched (the state expanded to the weights if only they
-        are), and compiled if `compile`: (forward_fn, state, batched)"""
+        """`forward` vmapped if the state or the weights are batched (the state expanded to
+        the weights if only they are), and compiled if `compile`"""
         forward_fn = self.forward
         name, p = next(iter(state.params.items()))
         batched_state = p.ndim > self.model.get_parameter(name).ndim
@@ -108,7 +108,7 @@ class Magic:
         Batch mode:
             `weights` and/or `init_state` can be batched, logging is disabled.
         Logging mode:
-            Log loss, train metrics, and norms of params/grads. No batching supported
+            Log loss, train metrics, norms of params/grads and `stats`. No batching supported
         Yields (t, state_t, grads_t) for each step, and (T, state_T, None) at the end
         """
         state = init_state.apply(lambda t: t.to(self.device, non_blocking=True, copy=True))
@@ -126,19 +126,21 @@ class Magic:
             loss = (losses if weights is None else weights[..., idx] * losses).mean(-1)  # [(R,)]
             grads = torch.autograd.grad(loss.sum(), params, create_graph=create_graph)
 
+            if not create_graph:
+                state = state.apply(lambda t: t.detach())
+            yield t, state, grads
+            state = state.step(t, grads).apply(lambda t: t.detach())
+
             if log is not None:
                 train_metrics = {k: v.mean() for k, v in metrics(out.detach(), Y).items()}
                 log.log(t, loss=loss.detach(), **train_metrics)
                 log.log_norms(t, "params", params)
                 log.log_norms(t, "grads", grads)
+                if isinstance(state, SecondOrderState):
+                    log.log(t, **state.stats)
                 if X.is_cuda:
                     log.log(t, gpu_gb=torch.tensor(torch.cuda.max_memory_allocated() / 2**30))
                     torch.cuda.reset_peak_memory_stats()
-
-            if not create_graph:
-                state = state.apply(lambda t: t.detach())
-            yield t, state, grads
-            state = state.step(t, grads).apply(lambda t: t.detach())
 
         yield start + n_steps, state, None
         return state.apply(lambda t: t.detach().cpu())
