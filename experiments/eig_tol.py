@@ -1,10 +1,10 @@
 """
 How good are the LOBPCG eigenvalues at a given tolerance? Train the experiment's model (DIR/full_model/start.pt, or the
 init if start = 0) and every --eig-every steps (from start + eig-every) compute the top --num-top-eigs and most negative
---num-neg-eigs eigenvalues of sqrt(P) H sqrt(P) (H of the step's batch mean loss, as train_logged.py logs "eig/i") at every --tol:
+--num-neg-eigs eigenvalues of sqrt(P) H sqrt(P) (H of the step's batch mean loss, `train` logs the unscaled ones as "eig/i") at every --tol:
   python -m experiments.eig_tol DIR [--num-top-eigs 2] [--num-neg-eigs 1] [--tol 1e-3 --tol 1e-1] [--eig-every 10] [--steps n]
                                     [--device cpu] [--no-show]
-Each tolerance keeps its own warm start (as in train_logged.py), from the same random block.
+Each tolerance keeps its own warm start (as in main.train_logged), from the same random block.
 
 Outputs in DIR/eig_tol/:
 - eig_tol.png: a panel per eigenvalue (1, 2, ..., -1, -2, ...) with a line per tolerance, and the LOBPCG iterations
@@ -21,21 +21,23 @@ from torch import Tensor
 
 from main import Experiment
 from src.lobpcg import hessian_eigs
+from src.logging import fig_title
 
 
 def eig_tol(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 2, num_neg_eigs: int = 1, tols: tuple[float, ...] = (1e-3, 1e-1),
             eig_every: int = 10, steps: int | None = None) -> dict:
     exp = Experiment(exp_dir, device)
     cfg, magic = exp.cfg, exp.magic
-    steps = cfg.n_steps - cfg.start if steps is None else steps
+    start, n_steps = exp.steps
+    steps = n_steps if steps is None else steps
     tols = tuple(sorted(tols))  # tightest first
     ks = {sign: k for sign, k in ((1, num_top_eigs), (-1, num_neg_eigs)) if k > 0}  # sign -> number of eigenpairs
     ids = [sign * (i + 1) for sign, k in ks.items() for i in range(k)]
     warm: dict[tuple[int, int], dict[str, Tensor]] = {}  # (tol index, sign) -> eigenvectors [ks[sign], *shape]
     out_steps, eigvals, iters = [], [], []
 
-    for t, state, _ in magic.train.trace(exp.start_state, n_steps=steps, start=cfg.start):
-        if (t - cfg.start) % eig_every != 0 or t == cfg.start:  # (2nd-order states: no P at start)
+    for t, state, _ in magic.train.trace(exp.start_state, n_steps=steps, start=start):
+        if (t - start) % eig_every != 0 or t == start:  # (2nd-order states: no P at start)
             continue
         X, Y, _ = magic.loader.get_batch(t)
         P, hvp_fn = state.precond(t), magic.hvp_fn(state.params, X, Y)
@@ -67,7 +69,7 @@ def eig_tol(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 2, num_neg_e
         click.echo(f"tol {tol:g} vs {tols[0]:g}: median relative difference " + ", ".join(f"eig {i}: {d:.2e}" for i, d in zip(ids, rel.tolist())))
 
     fig, axes = plt.subplots(1, len(ids) + 1, figsize=(3.6 * (len(ids) + 1), 2.8), squeeze=False, layout="constrained")
-    fig.suptitle(f"LOBPCG eigenvalues of sqrt(P) H sqrt(P) by tolerance; {exp.name}", fontsize=10)
+    fig_title(fig, f"LOBPCG eigenvalues of sqrt(P) H sqrt(P) by tolerance; {exp.name}")
     for c, i in enumerate(ids):
         ax = axes[0, c]
         for j, tol in enumerate(tols):

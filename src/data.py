@@ -8,12 +8,13 @@ from torch import Tensor
 
 class Dataset:
     """Classification dataset with int labels. Subclasses set `in_shape`, `out_dim`, `labels`, `ids` and implement
-    `examples`."""
+    `_examples`."""
 
     in_shape: tuple[int, ...]
     out_dim: int  # number of classes
     labels: Tensor  # [N] int64, on CPU
     ids: Tensor  # [N] the examples' original indices (arange, unless `take`n)
+    _cache: tuple[Tensor, Tensor] | None = None  # all the (X, Y), set by `to`
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -23,8 +24,25 @@ class Dataset:
         original order; `ids` maps them to the originals)."""
         keep = torch.randperm(len(self), generator=torch.Generator().manual_seed(seed))[:n].sort().values
         self.ids, self.labels = self.ids[keep], self.labels[keep]
+        self._cache = None
+
+    def to(self, device: torch.device | str | None):
+        """Build all the examples once, X in the default dtype, and keep them on `device` (MNIST, CIFAR10: < 1.5 GB in
+        fp64): `examples` then only indexes them."""
+        X, Y = self._examples(torch.arange(len(self)))
+        self._cache = X.to(device), Y.to(device)
+        return self
 
     def examples(self, idx: Tensor) -> tuple[Tensor, Tensor]:
+        """(X, Y) of the examples `idx` (a CPU tensor), X in the default dtype at call time; on CPU, or on the device
+        of `to`."""
+        if self._cache is None:
+            return self._examples(idx)
+        X, Y = self._cache
+        idx = idx.to(X.device)
+        return X[idx].to(torch.get_default_dtype()), Y[idx]
+
+    def _examples(self, idx: Tensor) -> tuple[Tensor, Tensor]:
         """(X, Y) of the examples `idx` (a CPU tensor), on CPU, X in the default dtype at call time."""
         raise NotImplementedError
 
@@ -51,7 +69,7 @@ class Dataset:
 
 
 class Images(Dataset):
-    """MNIST or CIFAR10 from torchvision, kept as uint8 [N, C, H, W] and normalized per batch."""
+    """MNIST or CIFAR10 from torchvision, kept as uint8 [N, C, H, W] and normalized per batch (or once, by `to`)."""
 
     stats = {"MNIST": ((0.1307,), (0.3081,)), "CIFAR10": ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))}
 
@@ -62,12 +80,13 @@ class Images(Dataset):
         X = torch.as_tensor(data.data)  # MNIST: [N, 28, 28]; CIFAR10: [N, 32, 32, 3]
         self.X = (X[:, None] if X.ndim == 3 else X.permute(0, 3, 1, 2)).contiguous()
         self.labels = torch.as_tensor(data.targets, dtype=torch.long)
+        self.classes = list(data.classes)  # label -> name
         self.ids = torch.arange(len(self.labels))
         mean, std = self.stats[name]
         self.mean, self.std = torch.tensor(mean, dtype=torch.float64)[:, None, None], torch.tensor(std, dtype=torch.float64)[:, None, None]
         self.in_shape, self.out_dim = tuple(self.X.shape[1:]), 10
 
-    def examples(self, idx: Tensor) -> tuple[Tensor, Tensor]:
+    def _examples(self, idx: Tensor) -> tuple[Tensor, Tensor]:
         dtype = torch.get_default_dtype()
         X = (self.X[self.ids[idx]].to(dtype) / 255 - self.mean.to(dtype)) / self.std.to(dtype)
         return X, self.labels[idx]
@@ -91,7 +110,7 @@ class Majority(Dataset):
         flip = torch.randn((), generator=g, dtype=torch.float64) > 2
         return x, torch.tensor(int((x.sum() > 0) != flip))
 
-    def examples(self, idx: Tensor) -> tuple[Tensor, Tensor]:
+    def _examples(self, idx: Tensor) -> tuple[Tensor, Tensor]:
         X, Y = zip(*(self.example(i) for i in self.ids[idx].tolist()))
         return torch.stack(X).to(torch.get_default_dtype()), torch.stack(Y)
 
@@ -107,6 +126,7 @@ class Loader:
     batch_size: int = 32
     device: torch.device | str | None = None
     seed: int = 0
+    repeat: int = 1  # the same batch for `repeat` consecutive steps
     _perm: tuple[int, Tensor] | None = field(default=None, repr=False)  # (epoch, its permutation), cached
 
     def batch_indices(self, step: int) -> Tensor:
@@ -114,7 +134,7 @@ class Loader:
         replacement (a permutation per epoch, seeded by `seed` and the epoch; its last len % batch_size examples are skipped)"""
         n_batches = len(self.dataset) // self.batch_size
         assert n_batches > 0, f"batch size {self.batch_size} > {len(self.dataset)} examples"
-        epoch, i = divmod(step, n_batches)
+        epoch, i = divmod(step // self.repeat, n_batches)
         if self._perm is None or self._perm[0] != epoch:
             g = torch.Generator().manual_seed(self.seed * 2**20 + epoch)  # (the CPU generator keeps the low 32 bits)
             self._perm = (epoch, torch.randperm(len(self.dataset), generator=g))

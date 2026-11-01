@@ -13,8 +13,8 @@ from src.utils import HVP
 def torch_lobpcg(
     A: Callable[[Tensor], Tensor],
     X: Tensor,
-    max_iter=200,  # SGD: usually ~1-5 for positive eigs, ~10-20 for negative eigs
-    rtol=0.05,  # effectively equal to rtol=1e-3 (with ~5-10x less iters)
+    max_iter=200,  # SGD: ~1-5 for positive eigs, ~10-20 for negative eigs
+    rtol=0.03,  # barely any difference from 1e-3 to 1e-1
 ) -> tuple[Tensor, Tensor, int]:
     """Finds the top k eigenvalues/eigenvectors of the n x n linear operator A.
 

@@ -39,11 +39,27 @@ def cross_entropy(out: Tensor, Y: Tensor) -> Tensor:
 
 
 def mse(out: Tensor, Y: Tensor) -> Tensor:
-    """Squared error to the one-hot labels"""
-    return 0.5 * (out - F.one_hot(Y, out.shape[1]).to(out.dtype)).pow(2).sum(-1)
+    """Squared error to the one-hot labels (built by comparison, as `F.one_hot` doesn't support vmap)"""
+    one_hot = (Y[:, None] == torch.arange(out.shape[1], device=out.device)).to(out.dtype)
+    return 0.5 * (out - one_hot).pow(2).sum(-1)
 
 
 LOSSES: dict[str, LossFn] = {"ce": cross_entropy, "mse": mse}
+
+
+def cross_entropy_output_hessian(out: Tensor, Y: Tensor, U: Tensor) -> Tensor:
+    """H_L U per example for the cross-entropy: (diag(p) - p p^T) u with p = softmax(out)"""
+    p = out.softmax(-1)
+    return p * (U - (p * U).sum(-1, keepdim=True))
+
+
+def mse_output_hessian(out: Tensor, Y: Tensor, U: Tensor) -> Tensor:
+    return U
+
+
+OUTPUT_HESSIANS: dict[LossFn, Callable[[Tensor, Tensor, Tensor], Tensor]] = {  # loss -> (out [B, C], Y [B], U [B, C]) -> H_L U [B, C]
+    cross_entropy: cross_entropy_output_hessian, mse: mse_output_hessian,
+}
 
 
 def metrics(out: Tensor, Y: Tensor) -> dict[str, Tensor]:

@@ -21,7 +21,7 @@ Outputs in DIR/drift/<direction>_eps<eps>_n<n>_steps<steps>/ (--replot redoes th
   pairwise distances in function space (RMS of the per-example loss differences on the test examples); per-example
   loss - center's loss (examples sorted by their spread across models); cosines of the initial directions and of the
   final displacements with the top / most negative --n-eigs eigenvectors of the (preconditioned) Hessian at the start
-  state (on the first training batch, as logged by train_logged.py); singular values of the final displacements
+  state (on the first training batch, as logged by `train`); singular values of the final displacements
   (participation ratio = effective number of directions the models spread along)
 - results.json: all of the above as numbers, plus summary statistics
 """
@@ -40,6 +40,7 @@ from torch import Tensor
 
 from main import Experiment
 from src.lobpcg import hessian_eigs
+from src.logging import fig_title
 from src.utils import dict_zip
 
 
@@ -50,7 +51,7 @@ def spec_norms(D: Tensor) -> Tensor:
 
 
 def randn_direction(params: dict[str, Tensor], index: int) -> dict[str, Tensor]:
-    """Gaussian, each tensor normalized to operator norm 1 (like the tangent of train_logged.py)."""
+    """Gaussian, each tensor normalized to operator norm 1 (like the tangent of main.train_logged)."""
     g = torch.Generator().manual_seed(index)
     d = {k: torch.randn(p.shape, generator=g, dtype=p.dtype) for k, p in params.items()}
     return {k: t / spec_norms(t[None])[0] for k, t in d.items()}
@@ -174,7 +175,7 @@ def plot(out_dir: Path, results: dict, title: str, show: bool):
     axes[2].set(title="displacements from the center along training\n(on the 2 principal directions of the final ones)",
                 xlabel="PC 1", ylabel="PC 2", aspect="equal")
     axes[2].legend(fontsize=7, ncol=2)
-    fig.suptitle(title, fontsize=10)
+    fig_title(fig, title)
     fig.savefig(out_dir / "drift.png", dpi=150)
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 9.5), layout="constrained")
@@ -212,7 +213,7 @@ def plot(out_dir: Path, results: dict, title: str, show: bool):
     axes[1, 2].set(title=f"spectrum of the final displacements (fraction of the variance per direction);\n"
                          f"participation ratio {results['summary']['participation ratio']:.2f} of {n}", xlabel="principal direction")
     axes[1, 2].title.set_fontsize(9)
-    fig.suptitle(title, fontsize=10)
+    fig_title(fig, title)
     fig.savefig(out_dir / "final.png", dpi=150)
     if show:
         plt.show()
@@ -226,13 +227,15 @@ def plot(out_dir: Path, results: dict, title: str, show: bool):
 @click.option("--steps", type=int, default=None, help="train this many steps from `start` (default: n_steps - start)")
 @click.option("--direction", type=click.Choice(list(DIRECTIONS)), default="randn", show_default=True, help="how the directions are sampled")
 @click.option("--traj-every", type=int, default=None, help="keep the displacements for the trajectory plot every this many steps (default: ~50 points)")
-@click.option("--n-test", type=int, default=10, show_default=True, help="fixed test examples the losses are compared on")
+@click.option("--n-test", type=int, default=1, show_default=True, help="fixed test examples the losses are compared on")
 @click.option("--n-eigs", type=int, default=2, show_default=True, help="top and most negative Hessian eigenvectors the directions are compared to")
 @click.option("--device", type=str, default="cpu", show_default=True)
 @click.option("--replot", is_flag=True, help="only redo the plots from results.json")
 @click.option("--show/--no-show", default=True, help="show the plots")
 def main(exp_dir, n_models, eps, steps, direction, traj_every, n_test, n_eigs, device, replot, show):
     exp = Experiment(exp_dir, device)
+    if exp.substeps != 1:
+        raise click.UsageError(f"{exp.cfg.optimizer} isn't comparable step by step with the other optimizers")
     steps = exp.cfg.n_steps - exp.cfg.start if steps is None else steps
     out_dir = exp_dir / "drift" / f"{direction}_eps{eps:g}_n{n_models}_steps{steps}"
     if replot:

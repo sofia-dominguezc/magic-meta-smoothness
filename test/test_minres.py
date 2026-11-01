@@ -102,7 +102,7 @@ def test_newton_state(float64):
     negative eigenvalue, and saves the direction and the stats (aux: no MAGIC state); its `vjp` matches autograd through
     `newton_step_unrolled`, and so does MAGIC through a training of such steps."""
     magic, train_ds, test_loader, state = setup("newton")
-    assert state.groups == ("params",) and state.aux == ("newton", "eigvec", "stats") and len(list(state)) == len(state.params)
+    assert state.groups == ("params",) and state.aux == ("ema_params", "newton", "eigvec", "stats") and len(list(state)) == len(state.params)
     X, Y, idx = magic.loader.get_batch(0)
     sizes = [p.numel() for p in state.params.values()]
     s = state.apply(lambda t: t.clone().requires_grad_())
