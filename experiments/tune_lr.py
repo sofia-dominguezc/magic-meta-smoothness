@@ -1,5 +1,5 @@
 """
-Train with several learning rates, pick the lowest final test loss and save it to DIR/config.json:
+Train with several learning rates, pick the lowest final test loss and save it to DIR/config.json if it has no lr yet:
   python -m experiments.tune_lr DIR [--lrs 0.01,0.02,...] [--steps n] [--magic] [--device cpu] [--no-show]
 
 Saves DIR/lr_tuning.json and the plots, one line per lr in each panel:
@@ -21,7 +21,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from main import HESSIAN, Experiment, parse_variant, train_logged
+from main import Experiment, magic_title, train_logged
 from src.logging import Logger, ema_smooth, fig_title
 
 Metrics = dict[str, dict[str, Tensor]]  # Logger.metrics()
@@ -71,9 +71,10 @@ def delta_total(metrics: Metrics, step: int) -> float:
 
 def tune_lr(
     exp_dir: Path, lrs: list[float], steps: int | None = None, device: str = "cpu", compile: bool = False, show: bool = True,
-    magic: bool = False, n_test: int = 1, variant: str = HESSIAN,
+    magic: bool = False, n_test: int = 1, gn: bool = False,
 ) -> float:
     exp = Experiment(exp_dir, device, compile)
+    config_lr = exp.cfg.lr
     exp = replace(exp, cfg=replace(exp.cfg, lr=lrs[0]))  # the config may have no lr yet
     steps = (exp.cfg.n_steps if steps is None else steps) * exp.substeps
     all_test = torch.arange(len(exp.test_ds))
@@ -84,7 +85,7 @@ def tune_lr(
         init_state = replace(exp.init_state, lr=replace(exp.init_state.lr, lr=lr))
         logger = Logger(f"lr {lr:g}", smooth=False, total_norms=True, step_scale=exp.substeps)
         final = train_logged(exp.magic, init_state, n_steps=steps, test_loader=exp.test_loader, logger=logger,
-                             eval_every=max(1, steps // 20), n_test=min(len(all_test), 1000), ema_decay=None)
+                             eval_every=max(1, steps // 20), n_test=min(len(all_test), 1000))
         train_runs[lr] = logger.metrics()
         loss, metrics = exp.magic.eval_loss({k: p.to(device) for k, p in final.params.items()}, exp.test_loader, all_test)
         losses.append(loss.item() if math.isfinite(loss.item()) else math.inf)
@@ -93,15 +94,17 @@ def tune_lr(
         if magic:
             logger = Logger(f"MAGIC lr {lr:g}", smooth=False, total_norms=True, step_scale=exp.substeps)
             eval_set = exp.test_ds.examples(exp.test_ds.subset(n_test, index=0))
-            gn_below, skip_below = parse_variant(variant, replace(exp.cfg, n_steps=steps))
-            exp.magic.backprop(init_state, n_steps=steps, eval_sets=[eval_set], gn_below=gn_below, skip_below=skip_below, log=logger)
+            exp.magic.backprop(init_state, n_steps=steps, eval_sets=[eval_set], gn=gn, log=logger)
             magic_runs[lr] = logger.metrics()
-            explosions.append(delta_total(magic_runs[lr], 0) / delta_total(magic_runs[lr], steps))
+            explosions.append(delta_total(magic_runs[lr], 0) / delta_total(magic_runs[lr], steps - 1))
             msg += f", explosion rate {explosions[-1]:.3g}"
         click.echo(msg)
     best = lrs[min(range(len(lrs)), key=lambda i: losses[i])]
-    click.echo(f"best lr: {best:g} (saved to {exp_dir / 'config.json'})")
-    (exp_dir / "config.json").write_text(json.dumps(asdict(replace(exp.cfg, lr=best)), indent=2))
+    if config_lr is None:
+        click.echo(f"best lr: {best:g} (saved to {exp_dir / 'config.json'})")
+        (exp_dir / "config.json").write_text(json.dumps(asdict(replace(exp.cfg, lr=best)), indent=2))
+    else:
+        click.echo(f"best lr: {best:g} (config keeps lr {config_lr:g})")
     summary = {"steps": steps, "lrs": lrs, "test_loss": losses, "test_acc": accs, "best": best}
     if magic:
         summary["explosion_rate"] = explosions
@@ -114,7 +117,7 @@ def tune_lr(
     plot_runs(train_runs, names, title, exp_dir / "lr_tuning_curves.png", log_names=norm_names)
     if magic:
         names = list(dict.fromkeys(n for m in magic_runs.values() for n in m))
-        plot_runs(magic_runs, names, f"MAGIC{'' if variant == HESSIAN else f' ({variant})'} on {n_test} test examples; {title}",
+        plot_runs(magic_runs, names, f"{magic_title(gn)} on {n_test} test examples; {title}",
                   exp_dir / "lr_tuning_magic.png",
                   log_names=set(names), smooth=False)
 
@@ -138,16 +141,16 @@ def tune_lr(
 
 @click.command(help=__doc__)
 @click.argument("exp_dir", type=click.Path(path_type=Path, file_okay=False))
-@click.option("--lrs", type=str, default="0.01,0.02,0.05,0.1,0.2,0.5,1,2,5", show_default=True, help="comma-separated learning rates")
+@click.option("--lrs", type=str, default="0.01,0.02,0.05,0.1,0.2,0.5,1", show_default=True, help="comma-separated learning rates")
 @click.option("--steps", type=int, default=None, help="train this many steps (default: n_steps)")
 @click.option("--magic/--no-magic", default=False, help="also run MAGIC on one test subset per lr (norms of df/ds_t, explosion rate)")
 @click.option("--n-test", type=int, default=1, show_default=True, help="test examples of the MAGIC eval subset")
-@click.option("--variant", type=str, default=HESSIAN, show_default=True, help="the MAGIC variant (see main.py magic --variant)")
+@click.option("--gn/--no-gn", default=False, help="MAGIC with the Gauss-Newton matrix in the backward (see main.py magic --gn)")
 @click.option("--device", type=str, default="cpu", show_default=True)
 @click.option("--compile/--no-compile", default=False, help="torch.compile the training passes")
 @click.option("--show/--no-show", default=True, help="show the plot")
-def main(exp_dir, lrs, steps, magic, n_test, variant, device, compile, show):
-    tune_lr(exp_dir, [float(v) for v in lrs.split(",")], steps, device, compile, show, magic=magic, n_test=n_test, variant=variant)
+def main(exp_dir, lrs, steps, magic, n_test, gn, device, compile, show):
+    tune_lr(exp_dir, [float(v) for v in lrs.split(",")], steps, device, compile, show, magic=magic, n_test=n_test, gn=gn)
 
 
 if __name__ == "__main__":

@@ -102,7 +102,7 @@ def test_newton_state(float64):
     negative eigenvalue, and saves the direction and the stats (aux: no MAGIC state); its `vjp` matches autograd through
     `newton_step_unrolled`, and so does MAGIC through a training of such steps."""
     magic, train_ds, test_loader, state = setup("newton")
-    assert state.groups == ("params",) and state.aux == ("ema_params", "newton", "eigvec", "stats") and len(list(state)) == len(state.params)
+    assert state.groups == ("params",) and state.aux == ("newton", "eigvec", "stats") and len(list(state)) == len(state.params)
     X, Y, idx = magic.loader.get_batch(0)
     sizes = [p.numel() for p in state.params.values()]
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -116,7 +116,7 @@ def test_newton_state(float64):
 
     H = torch.func.hessian(flat_loss)(torch.cat([p.detach().flatten() for p in s.params.values()]))
     rhs = torch.cat([(g + 0.01 * p).detach().flatten() for p, g in dict_zip(s.params, grads).values()])
-    new = s.step(0, grads)
+    new = s._update(0, grads)
     min_eig = torch.linalg.eigvalsh(H)[0]
     assert min_eig < 0 and state._shift(new.stats["min_eig"]) > state.damping  # the shift is active: the Rayleigh term of `vjp` is tested
     torch.testing.assert_close(new.stats["min_eig"], min_eig, rtol=0.1, atol=0)  # (LOBPCG rtol, from a random start)
@@ -130,7 +130,8 @@ def test_newton_state(float64):
     g = torch.Generator().manual_seed(0)
     delta = new.apply(lambda t: torch.randn(2, *t.shape, generator=g))  # 2 cotangents on the new state (aux ignored)
     expected = torch.autograd.grad(list(newton_step_unrolled(s, 0, grads)), [*s, w], list(delta), is_grads_batched=True, retain_graph=True)
-    cotangents = s.vjp(0, grads, [*s, w], delta)  # (frees the graph: the last use of `grads` in backprop too)
+    forward_fn = lambda p: ((w[idx] * cross_entropy(functional_call(magic.model, p, (X,)), Y)).mean(), None)
+    cotangents = s.vjp(0, forward_fn, [*s, w], delta)
     assert len(cotangents) == len(expected) == len(sizes) + 1
     for a, b in zip(cotangents, expected):
         torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-8)

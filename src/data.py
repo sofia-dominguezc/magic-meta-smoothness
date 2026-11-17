@@ -65,7 +65,7 @@ class Dataset:
             w[self.subset(round(alpha * len(self)), index)] = 0
             return w
         assert kind == "randn", kind
-        return 1 + alpha**0.5 * torch.randn(len(self), generator=torch.Generator().manual_seed(index))
+        return 1 + alpha**0.5 * torch.randn(len(self), generator=torch.Generator().manual_seed(index), dtype=torch.float32).to(torch.get_default_dtype())
 
 
 class Images(Dataset):

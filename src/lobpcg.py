@@ -153,7 +153,7 @@ def unflatten(V: Tensor, shapes: Mapping[str, torch.Size]) -> dict[str, Tensor]:
 
 def hessian_eigs(
     hvp_fn: HVP, eigvecs: dict[str, Tensor],
-    precond: Mapping[str, Tensor | float] | None = None, sign: float = 1, batched: bool = True,
+    precond: Mapping[str, Tensor | float] | None = None, sign: float = 1, batched: bool = True, rtol: float = 0.03,
 ) -> tuple[Tensor, dict[str, Tensor], int]:
     """The top (sign -1: most negative) eigenvalues of sqrt(P) H sqrt(P) by `torch_lobpcg`.
     eigvecs {name: [k, *shape]} -> (eigenvalues [k], eigenvectors like `eigvecs`, LOBPCG iterations)
@@ -172,5 +172,5 @@ def hessian_eigs(
         return sign * (HV if sqrt_p is None else sqrt_p * HV)
 
     X = flatten(eigvecs, batched)
-    eigvals, V, n_iter = torch_lobpcg(A, X if batched else X[:, None])
+    eigvals, V, n_iter = torch_lobpcg(A, X if batched else X[:, None], rtol=rtol)
     return sign * (eigvals if batched else eigvals[0]), unflatten(V if batched else V[:, 0], shapes), n_iter

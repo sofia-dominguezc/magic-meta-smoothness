@@ -25,6 +25,7 @@ def hvp_from_grads(grads: dict[str, Tensor], params: dict[str, Tensor]) -> HVP:
             list(grads.values()), params, [V[k] for k in grads],
             retain_graph=True, create_graph=create_graph, is_grads_batched=batched,
         )
+
     return hvp_fn
 
 

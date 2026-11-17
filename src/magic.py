@@ -1,5 +1,6 @@
 import math
 import functools
+from functools import partial
 from tqdm import tqdm
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Concatenate, Generator, Iterator, Self, Sequence, overload
@@ -9,11 +10,8 @@ from torch import Tensor, nn
 
 from src.data import Loader
 from src.logging import Logger
-from src.optimizers import OptimState, SecondOrderState
+from src.optimizers import OptimState, SecondOrderState, SGDState
 from src.utils import HVP, OUTPUT_HESSIANS, LossFn, hvp_from_grads, metrics, model_call
-
-Forward = Callable[[dict[str, Tensor], Tensor, Tensor], tuple[Tensor, Tensor]]  # (params, X, Y) -> (per-example losses, outputs)
-Backward = Callable[[dict[str, Tensor], Tensor, Tensor], dict[str, Tensor]]
 
 
 class traceable[**P, Y, R]:
@@ -62,10 +60,30 @@ class Magic:
     def device(self) -> torch.device | str | None:
         return self.loader.device
 
-    def forward(self, params: dict[str, Tensor], X: Tensor, Y: Tensor) -> tuple[Tensor, Tensor]:
-        """The model on a batch: (per-example losses [B], outputs [B, C])"""
+    def forward(
+        self, params: dict[str, Tensor], X: Tensor, Y: Tensor, weights: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """The model on a batch: (mean loss, with the example `weights` [B] if given; outputs [B, C])"""
         out = model_call(self.model, params, X, bf16=self.bf16)
-        return self.loss_fn(out, Y), out
+        losses = self.loss_fn(out, Y)
+        return (losses if weights is None else weights * losses).mean(), out
+
+    def _train_forward(self, state: OptimState, weights: Tensor | None) -> tuple[Callable, OptimState, bool]:
+        """Compile and vmap Magic.forward if specified. `weights`: [N] loss weights of the training examples
+        Batch mode (first-order optimizers): `weights` [R, N] and/or a batched `init_state` train R models, vmapped
+        """
+        name, p = next(iter(state.params.items()))
+        batched = p.ndim > self.model.get_parameter(name).ndim
+        if weights is not None and weights.ndim == 2 and not batched:
+            state, batched = state.apply(lambda t: t.expand(len(weights), *t.shape).clone()), True
+        assert not (batched and isinstance(state, SecondOrderState)), "can't vmap a second-order step"
+        forward_fn = self.forward
+        if batched:
+            vmapped = torch.func.vmap(forward_fn, in_dims=(0, None, None, None if weights is None else 0))
+            forward_fn = lambda params, X, Y, weights=None: vmapped(params, X, Y, weights)
+        if self.compile:
+            forward_fn = torch.compile(forward_fn)
+        return forward_fn, state, batched
 
     @torch.no_grad()
     def eval_loss(self, params: dict[str, Tensor], loader: Loader, indices: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
@@ -73,8 +91,8 @@ class Magic:
         n = len(indices)
         loss, mean_metrics = torch.zeros((), device=loader.device), {}
         for X, Y in loader.iter_batches(indices):
-            losses, out = self.forward(params, X, Y)
-            loss += losses.sum() / n
+            batch_loss, out = self.forward(params, X, Y)
+            loss += batch_loss * len(X) / n
             for k, v in metrics(out, Y).items():
                 mean_metrics[k] = mean_metrics.get(k, 0) + v.sum() / n
         return loss, mean_metrics
@@ -82,24 +100,8 @@ class Magic:
     def hvp_fn(self, params: dict[str, Tensor], X: Tensor, Y: Tensor) -> HVP:
         """`hvp_from_grads` of the mean loss of the batch (X, Y) at `params`"""
         params = {k: p.detach().requires_grad_() for k, p in params.items()}
-        grads = torch.autograd.grad(self.forward(params, X, Y)[0].mean(), params, create_graph=True)
+        grads = torch.autograd.grad(self.forward(params, X, Y)[0], params, create_graph=True)
         return hvp_from_grads(grads, params)
-
-    def forward_fn(self, state: OptimState, weights: Tensor | None) -> tuple[Forward, OptimState, bool]:
-        """`forward` vmapped if the state or the weights are batched (the state expanded to
-        the weights if only they are), and compiled if `compile`"""
-        forward_fn = self.forward
-        name, p = next(iter(state.params.items()))
-        batched_state = p.ndim > self.model.get_parameter(name).ndim
-        batched_weights = weights is not None and weights.ndim == 2
-        if batched_weights and not batched_state:
-            assert weights is not None
-            state = state.apply(lambda t: t.expand(len(weights), *t.shape).clone())
-        if batched_weights or batched_state:
-            forward_fn = torch.func.vmap(forward_fn, in_dims=(0, None, None))
-        if self.compile:
-            forward_fn = torch.compile(forward_fn)
-        return forward_fn, state, batched_weights or batched_state
 
     @traceable
     def train(
@@ -108,42 +110,31 @@ class Magic:
         pbar: bool = True,
     ) -> Generator[tuple[int, OptimState, dict[str, Tensor] | None], None, OptimState]:
         """Train on steps [start, start + n_steps) and return the trained state.
-        Batch mode:
-            `weights` and/or `init_state` can be batched; only the scalars are logged, as [R] vectors
-        Logging mode:
-            Log loss, train metrics, norms of params/grads and `stats`
-        Yields (t, state_t, grads_t) for each step, and (T, state_T, None) at the end
+        `create_graph`: yield the grads with their graph (for HVPs)
         `hook`: replaces the detaching of the state after each step (and is applied to the initial state)
+        Yields (t, state_t, grads_t) for each step, and (T, state_T, None) at the end
         """
         state = init_state.apply(lambda t: t.to(self.device, non_blocking=True, copy=True))
         if weights is not None:
             weights = weights.to(self.device, non_blocking=True)
-        forward_fn, state, batched = self.forward_fn(state, weights)
-        second_order = isinstance(state, SecondOrderState)  # (the step needs the graph of the gradients)
-        create_graph = create_graph or second_order
-        assert not (batched and second_order), "can't vmap a second-order step"
+        forward_fn, state, batched = self._train_forward(state, weights)
+        second_order = isinstance(state, SecondOrderState)  # (its grads always have their graph)
+        keep_graph = create_graph or second_order or hook is not None
         if hook is not None:
             state = hook(state)
 
         for t in tqdm(range(start, start + n_steps), disable=not pbar, desc="train"):
             X, Y, idx = self.loader.get_batch(t)
             params = {k: p.requires_grad_() for k, p in state.params.items()}
-            losses, out, aux_loss = state.forward(forward_fn, X, Y)  # [(R,) B], [(R,) B, C]
+            forward_step = partial(forward_fn, X=X, Y=Y, weights=None if weights is None else weights[..., idx])
 
-            loss = (losses if weights is None else weights[..., idx] * losses).mean(-1)  # [(R,)]
-            if aux_loss is not None:
-                aux_loss = (aux_loss if weights is None else weights[..., idx] * aux_loss).mean(-1)
-            grads = torch.autograd.grad(loss.sum(), params, create_graph=create_graph)
-
-            if not create_graph and hook is None:
-                state = state.apply(lambda t: t.detach())
-            yield t, state, grads
-            state = state.step(t, grads, aux_loss)
-            state = state.apply(lambda t: t.detach()) if hook is None else hook(state)
+            next_state, grads, loss, out = state.step(t, forward_step, create_graph=create_graph and not second_order)
+            yield t, state if keep_graph else state.apply(lambda t: t.detach()), grads
+            state = next_state.apply(lambda t: t.detach()) if hook is None else hook(next_state)
 
             if log is not None:
                 metrics_fn = torch.func.vmap(metrics, in_dims=(0, None)) if batched else metrics
-                train_metrics = {k: v.mean(-1) for k, v in metrics_fn(out.detach(), Y).items()}  # [(R,)]
+                train_metrics = {k: v.mean(-1) for k, v in metrics_fn(out.detach(), Y).items()}
                 log.log(t, loss=loss.detach(), **train_metrics)
                 if not batched:
                     log.log_norms(t, "params", params)
@@ -202,7 +193,7 @@ class Magic:
     def batched_grads_fn(self, params: dict[str, Tensor], X: Tensor, Y: Tensor) -> dict[str, Tensor]:
         """Per-example gradients {name: [B, *shape]} of the batch (X, Y) at `params`"""
         def example_loss(params: dict[str, Tensor], x: Tensor, y: Tensor) -> Tensor:
-            return self.forward(params, x[None], y[None])[0].squeeze(0)
+            return self.forward(params, x[None], y[None])[0]
 
         batched_grads = torch.func.vmap(torch.func.grad(example_loss), in_dims=(None, 0, 0))
         return (torch.compile(batched_grads) if self.compile else batched_grads)(params, X, Y)
@@ -210,66 +201,58 @@ class Magic:
     @traceable
     def backprop(
         self, init_state: OptimState, *, n_steps: int, start: int = 0, eval_sets: Sequence[tuple[Tensor, Tensor]],
-        passes: int = 2, gn_below: int | None = None, skip_below: int | None = None, log: Logger | None = None,
+        passes: int = 2, gn: bool = False, perturbed: range | None = None, log: Logger | None = None,
     ) -> Generator[tuple[int, OptimState, OptimState, Tensor], None, tuple[Tensor, Tensor]]:
         """MAGIC: backpropagate f_i = mean loss on the examples (X_i, Y_i) of `eval_sets` through steps
         [start, start + n_steps), all at once (batched cotangents: chunk the eval sets to bound the memory).
         Returns: (f(s_T) [#fns], df/dw [#fns, N])
-        Yields (t, s_t, df/ds_t, df/dw_t [#fns, B]) for the steps t >= `skip_below`
-        Logs "f/<i>" = f_i(s_t), the norms of df/ds_t ("delta/<i>") and |df/dw_t| ("d_weights/<i>") at each step.
+        Yields (t, s_t, df/ds_t, df/dw_t [#fns, B]) for the steps t >= min(perturbed)
         """
-        gn_below = start if gn_below is None else gn_below
-        end = max(start, start if skip_below is None else skip_below)  # the first step of the backward's range
-        assert end <= max(gn_below, end) <= start + n_steps, (skip_below, gn_below)
+        perturbed = range(start, start + n_steps) if perturbed is None else perturbed
+        assert perturbed.step == 1 and start <= perturbed.start <= perturbed.stop <= start + n_steps, (perturbed, start, n_steps)
 
         n_fns = len(eval_sets)
-        states = self.replay(init_state, n_steps=n_steps, start=start, passes=passes)
-        final_state = next(states).apply(lambda t: t.to(self.device).requires_grad_())
+        replayed_states = self.replay(init_state, n_steps=n_steps, start=start, passes=passes)
+        final_state = next(replayed_states).apply(lambda t: t.to(self.device).requires_grad_())
 
         outputs: list[Tensor] = []  # f(s_T)
         f_grads: list[dict[str, Tensor]] = []  # df/ds_T
         for X, Y in eval_sets:
-            f = self.forward(final_state.params, X.to(self.device), Y.to(self.device))[0].mean()
+            f = self.forward(final_state.params, X.to(self.device), Y.to(self.device))[0]
             outputs.append(f.detach())
             f_grads.append(torch.autograd.grad(f, final_state.params))
-        delta = replace(  # df/ds_t
+        delta = replace(  # df/ds_t [#fns, ...]
             final_state.apply(lambda t: t.new_zeros(n_fns, *t.shape)),
             params={k: torch.stack([g[k] for g in f_grads]) for k in final_state.params}
         )
         betas = torch.zeros(n_fns, len(self.loader.dataset), device=self.device)  # df/dw
-        if log is not None:
-            for i in range(n_fns):
-                log.log_norms(start + n_steps, f"delta/{i}", delta.apply(lambda d: d[i]))
-                log.log(start + n_steps, **{f"f/{i}": outputs[i]})
 
-        pbar = tqdm(total=start + n_steps - end, desc="magic")
-        for t, state in zip(reversed(range(start, start + n_steps)), states):
-            if t < end:
+        pbar = tqdm(total=start + n_steps - perturbed.start, desc="magic")
+        for t, state in zip(reversed(range(start, start + n_steps)), replayed_states):
+            if t < perturbed.start:
                 break
             pbar.update()
             X, Y, indices = self.loader.get_batch(t)
             state = state.apply(lambda t: t.to(self.device, non_blocking=True).requires_grad_())
-            weights = torch.ones_like(indices, dtype=X.dtype).requires_grad_()
 
-            if t < gn_below:
-                assert not isinstance(state, SecondOrderState)
-                assert type(state).forward is OptimState.forward, "the GN backward takes the gradients at the params"
+            if gn:
+                assert type(state) is SGDState, "the GN backward is only implemented for SGD"
                 batched_grads = self.batched_grads_fn(state.params, X, Y)  # detached
-                grads = {k: torch.tensordot(weights, g, dims=1) / len(X) for k, g in batched_grads.items()}
-                delta, (d_weights,) = state.gn_vjp(t, grads, [weights], delta, self.gnvp_fn(state.params, X, Y))
+                delta, d_grads = state.gn_vjp(t, delta, self.gnvp_fn(state.params, X, Y))
+                d_weights = sum(d_grads[k].flatten(1) @ g.flatten(1).T for k, g in batched_grads.items()) / len(X)  # [#fns, B]
             else:
-                losses, _, aux_loss = state.forward(self.forward, X, Y)
-                loss, aux_loss = (weights * losses).mean(), None if aux_loss is None else (weights * aux_loss).mean()
-                grads = torch.autograd.grad(loss, state.params, create_graph=True)
-                *d_state, d_weights = state.vjp(t, grads, [*state, weights], delta, aux_loss)
+                weights = torch.ones_like(indices, dtype=X.dtype).requires_grad_()
+                forward_fn = partial(self.forward, X=X, Y=Y, weights=weights)
+                *d_state, d_weights = state.vjp(t, forward_fn, [*state, weights], delta)
                 delta = delta.unflatten(d_state)
+            if t in perturbed:
+                betas.index_add_(1, indices, d_weights)
 
-            betas.index_add_(1, indices, d_weights)
             if log is not None:
                 params = {k: p.detach() for k, p in state.params.items()}
                 for i, (X_i, Y_i) in enumerate(eval_sets):
                     with torch.no_grad():
-                        f_t = self.forward(params, X_i.to(self.device), Y_i.to(self.device))[0].mean()
+                        f_t = self.forward(params, X_i.to(self.device), Y_i.to(self.device))[0]
                     log.log(t, **{f"f/{i}": f_t})
                     log.log_norms(t, f"delta/{i}", delta.apply(lambda d: d[i]))
                     log.log(t, **{f"d_weights/{i}": d_weights[i].norm()})

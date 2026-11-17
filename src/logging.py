@@ -70,7 +70,8 @@ class Logger:
     """Accumulates per-step scalars on the device and only moves them to the CPU every `flush_every` values,
     so training never syncs.
     - metric names are "panel" or "panel/line": `finish` plots one panel per panel name, one line per line name;
-      the line "ema" (the metric computed with an EMA of the params) is drawn dotted gray; the "d_weights" panel is log scale
+      the line "ema" (the metric computed with an EMA of the params) is drawn dotted gray, unsmoothed; the "d_weights" panel is log scale;
+      a panel "<direction>_hess" holds the curvature along a direction v: its lines "Hv" (||H v|| / ||v||) and "vHv" (v^T H v / v^T v)
     - `log_norms` logs the `scaled_l2` norm of each tensor (`total_norms`: one value per name / state group, the total L2 norm,
       plotted as a log-scale scalar panel: "<name>/<group>", or "<prefix>/<group>/<i>" for a name "<prefix>/<i>" so that the
       panel is per group with a line per i, e.g. per eval set)
@@ -81,13 +82,13 @@ class Logger:
       total norms), "displacement/<quantity>/lag<k>" (a line per lag) for several. It keeps the last max(lags) steps of each
       quantity in memory (on the device); `lags=()` logs no displacements
     - the "eig" panel is for the Hessian eigenvalues (top "eig/1", ...; most negative "eig/-1", ...): its lines
-      "threshold" (the logged stability threshold) and "batch_sharpness" are styled; the constant `eos` is drawn, if set
+      "threshold" (the logged stability threshold) is styled; the constant `eos` is drawn, if set
     """
 
     def __init__(self, name: str = "logging run", *, flush_every: int = 100, smooth: bool = True, split_norms: bool = False,
                  total_norms: bool = False, lags: tuple[int, ...] = (1,), step_scale: int = 1):
         self.name = name
-        self.step_scale = step_scale  # plots show step / step_scale (edge flow: GD steps)
+        self.step_scale = step_scale  # plots show step / step_scale (edge / central flow: GD steps)
         self.flush_every = flush_every
         self.smooth = smooth  # EMA-smooth the scalar plots (when there are enough points)
         self.split_norms = split_norms  # one norms plot per OptimState group (the last component of the panel names)
@@ -96,6 +97,7 @@ class Logger:
         self._lag_buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)  # quantity -> (step, flat vector) of the last max(lags) steps
         self.eos: float | None = None  # `OptimState.stability_threshold`, drawn in the "eig" panel
         self.log_panels: set[str] = set()  # scalar panels drawn in log scale (besides the norms)
+        self.yscale: str | None = None  # forces this scale on the norms and the norm-like scalar panels and "eig" (None: log, "eig" linear)
         self._buf: dict[str, list[tuple[int, Tensor]]] = defaultdict(list)
         self._history: dict[str, list[tuple[list[int], Tensor]]] = defaultdict(list)  # (steps, values) per flush
         self._norm_panels: set[str] = set()
@@ -183,7 +185,18 @@ class Logger:
         fig_title(fig, self.name)
         return fig, list(axes.flat[:n_panels])
 
+    EIG_STATS = ("sharpness", "min_eig", "eig_iters", "newton_iters", "residual", "n_critical", "oscillation")  # a second-order step's stats, eig-related
+
+    def _panel_order(self, panel: str) -> int:
+        """Train metrics, then test metrics, then the eigenvalues and their stats, then the curvatures / |cos| with the eigenvectors"""
+        if panel.endswith(("_eig", "_hess")):
+            return 3
+        if panel.startswith(("eig", "lobpcg_iters")) or panel in self.EIG_STATS:
+            return 2
+        return 1 if panel.startswith("test_") else 0
+
     def _plot_scalars(self, metrics: dict, panels: dict[str, list[str]], out_path: Path):
+        panels = dict(sorted(panels.items(), key=lambda item: self._panel_order(item[0])))
         fig, axes = self._grid(len(panels), ncols=4, size=(4.5, 3.4))
         for ax, (panel, names) in zip(axes, panels.items()):
             i = 0  # color index of the next line
@@ -196,8 +209,9 @@ class Logger:
                     color, ls, label = "0.45", ":", "ema of params"
                 elif panel == "eig" and label == "threshold":
                     color, ls, label = "0.45", "--", "stability threshold"
-                elif panel == "eig" and label == "batch_sharpness":
-                    color, ls, label = "0.2", "-", "batch sharpness g^T H g / g^T g"
+                elif panel.endswith("_hess"):
+                    label = {"Hv": "||Hv|| / ||v||", "vHv": "v^T H v / v^T v"}.get(label, label)
+                    color, ls, i = f"C{i}", "-", i + 1
                 else:
                     color, ls, i = f"C{i}", "-", i + 1
                 style = f"o{ls}" if len(steps) == 1 or len(steps) > 1 and steps[1] - steps[0] > 1 else ls  # not per-step: show the points
@@ -205,7 +219,7 @@ class Logger:
                     for j in range(arr.shape[1]):
                         ax.plot(steps, arr[:, j], style, ms=3, lw=1, color=f"C{i}", label=f"{label} #{j}" if label else str(j))
                         i += 1
-                elif self.smooth and len(steps) >= 20 and panel != "lr":  # enough points: smooth (not the schedule)
+                elif self.smooth and len(steps) >= 20 and panel != "lr" and color != "0.45":  # enough points: smooth (not the schedule, the EMA of params or the threshold)
                     ax.plot(steps, arr, style, alpha=0.3, lw=0.8, ms=2, color=color)
                     ax.plot(steps, ema_smooth(steps, arr), ls, lw=1.2, color=color, label=label)
                 else:
@@ -214,12 +228,14 @@ class Logger:
                 ax.axhline(self.eos, color="gray", ls=":", lw=1, label=f"stability threshold {self.eos:g}")
             if i > 1 or len(names) > 1 or panel == "eig":
                 ax.legend(fontsize=7)
-            log_scale = panel == "d_weights" or panel in self._norm_panels or panel in self.log_panels or panel.startswith("displacement/")
-            ax.set(title=panel, xlabel="step", yscale="log" if log_scale else "linear")
+            norm_like = panel == "d_weights" or panel in self._norm_panels or panel in self.log_panels or panel.startswith("displacement/")
+            ax.set(title=panel, xlabel="step", yscale=self.yscale if self.yscale and (norm_like or panel == "eig") else "log" if norm_like else "linear")
+            if panel.endswith("_eig"):  # |cos|
+                ax.set_ylim(0, 1)
             ax.title.set_fontsize(9)
         fig.savefig(out_path, dpi=150)
 
-    def _plot_norms(self, metrics: dict, panels: dict[str, list[str]], out_path: Path, yscale='log', split: bool = False):
+    def _plot_norms(self, metrics: dict, panels: dict[str, list[str]], out_path: Path, split: bool = False):
         """Lines colored by layer (the tensor name without its last component) and styled by that component.
         `split`: one plot <out_path>_<group>.png per group = last component of the panel names, the panels in a square."""
         tensors = list(dict.fromkeys(n.rsplit("/", 1)[1] for names in panels.values() for n in names))
@@ -242,7 +258,7 @@ class Logger:
                     steps = metrics[name]["step"].numpy() / self.step_scale
                     ax.plot(steps, metrics[name]["value"].numpy(), styles.get(kind, ":"), marker="o" if len(steps) == 1 else None,
                             lw=1, color=colors[layer or kind], label=tensor)
-                ax.set(title=panel, xlabel="step", **({"yscale": yscale} if yscale is not None else {}))
+                ax.set(title=panel, xlabel="step", yscale=self.yscale or "log")
                 ax.title.set_fontsize(9)
             handles, labels = axes[0].get_legend_handles_labels()
             fig.legend(handles, labels, loc="outside right center", fontsize=6, frameon=False)
