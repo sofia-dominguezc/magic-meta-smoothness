@@ -94,7 +94,8 @@ def tune_lr(
         if magic:
             logger = Logger(f"MAGIC lr {lr:g}", smooth=False, total_norms=True, step_scale=exp.substeps)
             eval_set = exp.test_ds.examples(exp.test_ds.subset(n_test, index=0))
-            exp.magic.backprop(init_state, n_steps=steps, eval_sets=[eval_set], gn=gn, log=logger)
+            delta = exp.magic.eval_grads(final, [eval_set])[1]
+            exp.magic.backprop(init_state, delta, n_steps=steps, eval_sets=[eval_set], gn=gn, log=logger)
             magic_runs[lr] = logger.metrics()
             explosions.append(delta_total(magic_runs[lr], 0) / delta_total(magic_runs[lr], steps - 1))
             msg += f", explosion rate {explosions[-1]:.3g}"

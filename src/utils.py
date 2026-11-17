@@ -5,7 +5,7 @@ from typing import Callable, Mapping, Protocol
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.func import functional_call
+from torch.func import functional_call, grad, jvp, vmap
 
 
 LossFn = Callable[[Tensor, Tensor], Tensor]  # (model output [B, C], int labels [B]) -> per-example losses [B]
@@ -25,6 +25,29 @@ def hvp_from_grads(grads: dict[str, Tensor], params: dict[str, Tensor]) -> HVP:
             list(grads.values()), params, [V[k] for k in grads],
             retain_graph=True, create_graph=create_graph, is_grads_batched=batched,
         )
+
+    return hvp_fn
+
+
+def _forward_hvp(forward_fn: Callable, params: dict[str, Tensor], V: dict[str, Tensor]) -> dict[str, Tensor]:
+    """H V for V {name: [m, *shape]}, forward-over-reverse"""
+    grad_fn = grad(lambda p: forward_fn(p)[0])
+    return vmap(lambda v: jvp(grad_fn, (params,), (v,))[1])(V)
+
+
+_compiled_forward_hvp = torch.compile(_forward_hvp)  # (module-level: one cache for every step's `forward_fn`)
+
+
+def hvp_from_forward(forward_fn: Callable, params: dict[str, Tensor], compile: bool = False) -> HVP:
+    """V -> H V of the loss `forward_fn(params)[0]` by torch.func, without a graph (`compile`: torch.compiled, once per number of vectors)"""
+    params = {k: p.detach() for k, p in params.items()}
+    hvp = _compiled_forward_hvp if compile else _forward_hvp
+
+    def hvp_fn(V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]:
+        assert not create_graph
+        if next(iter(V.values())).ndim > next(iter(params.values())).ndim:
+            return hvp(forward_fn, params, V)
+        return {k: Hv[0] for k, Hv in hvp(forward_fn, params, {k: v[None] for k, v in V.items()}).items()}
 
     return hvp_fn
 

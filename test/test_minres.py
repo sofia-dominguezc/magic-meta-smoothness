@@ -137,7 +137,8 @@ def test_newton_state(float64):
         torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-8)
 
     n_steps, eval_sets = 3, [torch.arange(10), torch.arange(20, 50)]
-    outputs, betas = magic.backprop(state, n_steps=n_steps, eval_sets=[test_loader.dataset.examples(idx) for idx in eval_sets])
+    outputs, delta = magic.eval_grads(magic.train(state, n_steps=n_steps), [test_loader.dataset.examples(idx) for idx in eval_sets])
+    betas = magic.backprop(state, delta, n_steps=n_steps)[1]
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
     for t in range(n_steps):

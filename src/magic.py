@@ -81,7 +81,7 @@ class Magic:
         if batched:
             vmapped = torch.func.vmap(forward_fn, in_dims=(0, None, None, None if weights is None else 0))
             forward_fn = lambda params, X, Y, weights=None: vmapped(params, X, Y, weights)
-        if self.compile:
+        if self.compile and not isinstance(state, SecondOrderState):
             forward_fn = torch.compile(forward_fn)
         return forward_fn, state, batched
 
@@ -117,8 +117,10 @@ class Magic:
         state = init_state.apply(lambda t: t.to(self.device, non_blocking=True, copy=True))
         if weights is not None:
             weights = weights.to(self.device, non_blocking=True)
-        forward_fn, state, batched = self._train_forward(state, weights)
         second_order = isinstance(state, SecondOrderState)  # (its grads always have their graph)
+        if weights is None and second_order:
+            weights = torch.ones(len(self.loader.dataset), device=self.device, dtype=next(iter(state.params.values())).dtype)
+        forward_fn, state, batched = self._train_forward(state, weights)
         keep_graph = create_graph or second_order or hook is not None
         if hook is not None:
             state = hook(state)
@@ -151,25 +153,23 @@ class Magic:
     def replay(
         self, init_state: OptimState, *, n_steps: int, start: int = 0, passes: int = 2, pbar: bool = True
     ) -> Iterator[OptimState]:
-        """Reconstruct the states [start, start + n_steps] in reverse order
+        """Reconstruct the states [start, start + n_steps) in reverse order
         Cost: `passes` trainings. Memory: `passes * n_steps^(1/passes)` states.
         """
-        if n_steps == 0:
-            yield init_state
+        if n_steps <= 1:
+            yield from [init_state][:n_steps]
             return
         chunk_size = math.ceil(n_steps ** ((passes - 1) / passes))
+        last_checkpoint = (n_steps - 1) // chunk_size * chunk_size
         checkpoints = [
             state.apply(lambda t: t.to("cpu", copy=True))
-            for t, state, _ in self.train.trace(init_state, n_steps=n_steps, start=start, pbar=pbar)
-            if (t - start) % chunk_size == 0 or t == start + n_steps
+            for t, state, _ in self.train.trace(init_state, n_steps=last_checkpoint, start=start, pbar=pbar)
+            if (t - start) % chunk_size == 0
         ]
-        yield checkpoints.pop()  # final state
         for i, ckpt in reversed(list(enumerate(checkpoints))):
             r_start = start + i * chunk_size
             r_steps = min(chunk_size, start + n_steps - r_start)
-            yield from self.replay(
-                ckpt, n_steps=r_steps - 1, start=r_start, passes=passes - 1, pbar=False
-            )
+            yield from self.replay(ckpt, n_steps=r_steps, start=r_start, passes=passes - 1, pbar=False)
 
     def gnvp_fn(self, params: dict[str, Tensor], X: Tensor, Y: Tensor) -> HVP:
         """Like `hvp_fn` for the Gauss-Newton matrix G = J^T H_L J / B.
@@ -198,42 +198,46 @@ class Magic:
         batched_grads = torch.func.vmap(torch.func.grad(example_loss), in_dims=(None, 0, 0))
         return (torch.compile(batched_grads) if self.compile else batched_grads)(params, X, Y)
 
+    def eval_grads(self, state: OptimState, eval_sets: Sequence[tuple[Tensor, Tensor]]) -> tuple[Tensor, OptimState]:
+        """(f(state) [#fns], df/d(state) batched over the fns): f_i = mean loss on the examples (X_i, Y_i) of `eval_sets`"""
+        state = state.apply(lambda t: t.detach().to(self.device).requires_grad_())
+        outputs: list[Tensor] = []
+        f_grads: list[dict[str, Tensor]] = []
+        for X, Y in eval_sets:
+            f = self.forward(state.params, X.to(self.device), Y.to(self.device))[0]
+            outputs.append(f.detach())
+            f_grads.append(torch.autograd.grad(f, state.params))
+        delta = replace(
+            state.apply(lambda t: t.new_zeros(len(eval_sets), *t.shape)),
+            params={k: torch.stack([g[k] for g in f_grads]) for k in state.params}
+        )
+        return torch.stack(outputs), delta
+
     @traceable
     def backprop(
-        self, init_state: OptimState, *, n_steps: int, start: int = 0, eval_sets: Sequence[tuple[Tensor, Tensor]],
-        passes: int = 2, gn: bool = False, perturbed: range | None = None, log: Logger | None = None,
-    ) -> Generator[tuple[int, OptimState, OptimState, Tensor], None, tuple[Tensor, Tensor]]:
-        """MAGIC: backpropagate f_i = mean loss on the examples (X_i, Y_i) of `eval_sets` through steps
-        [start, start + n_steps), all at once (batched cotangents: chunk the eval sets to bound the memory).
-        Returns: (f(s_T) [#fns], df/dw [#fns, N])
-        Yields (t, s_t, df/ds_t, df/dw_t [#fns, B]) for the steps t >= min(perturbed)
+        self, init_state: OptimState, delta: OptimState, *, n_steps: int, start: int = 0, passes: int = 2, gn: bool = False,
+        perturbed: range | None = None, eval_sets: Sequence[tuple[Tensor, Tensor]] = (), log: Logger | None = None,
+    ) -> Generator[tuple[int, OptimState, OptimState, Tensor], None, tuple[OptimState, Tensor]]:
+        """MAGIC: backpropagate `delta` = df/ds_{start + n_steps} (batched over the fns, see `eval_grads`) through steps
+        [start, start + n_steps), down to min(perturbed) at most.
+        Returns: (df/ds_start, df/dw [#fns, N] of the steps in `perturbed`)
+        Yields (t, s_t, df/ds_t, df/dw_t [#fns, B]) for each step
         """
         perturbed = range(start, start + n_steps) if perturbed is None else perturbed
-        assert perturbed.step == 1 and start <= perturbed.start <= perturbed.stop <= start + n_steps, (perturbed, start, n_steps)
+        assert perturbed.step == 1, perturbed
 
-        n_fns = len(eval_sets)
+        delta = delta.apply(lambda t: t.to(self.device))
+        n_fns = len(next(iter(delta)))
         replayed_states = self.replay(init_state, n_steps=n_steps, start=start, passes=passes)
-        final_state = next(replayed_states).apply(lambda t: t.to(self.device).requires_grad_())
-
-        outputs: list[Tensor] = []  # f(s_T)
-        f_grads: list[dict[str, Tensor]] = []  # df/ds_T
-        for X, Y in eval_sets:
-            f = self.forward(final_state.params, X.to(self.device), Y.to(self.device))[0]
-            outputs.append(f.detach())
-            f_grads.append(torch.autograd.grad(f, final_state.params))
-        delta = replace(  # df/ds_t [#fns, ...]
-            final_state.apply(lambda t: t.new_zeros(n_fns, *t.shape)),
-            params={k: torch.stack([g[k] for g in f_grads]) for k in final_state.params}
-        )
         betas = torch.zeros(n_fns, len(self.loader.dataset), device=self.device)  # df/dw
 
-        pbar = tqdm(total=start + n_steps - perturbed.start, desc="magic")
+        pbar = tqdm(total=start + n_steps - max(start, perturbed.start), desc="magic")
         for t, state in zip(reversed(range(start, start + n_steps)), replayed_states):
             if t < perturbed.start:
                 break
             pbar.update()
             X, Y, indices = self.loader.get_batch(t)
-            state = state.apply(lambda t: t.to(self.device, non_blocking=True).requires_grad_())
+            state = state.apply(lambda t: t.detach().to(self.device, non_blocking=True).requires_grad_())
 
             if gn:
                 assert type(state) is SGDState, "the GN backward is only implemented for SGD"
@@ -259,4 +263,4 @@ class Magic:
             yield t, state, delta, d_weights
         pbar.close()
 
-        return torch.stack(outputs), betas
+        return delta, betas

@@ -3,9 +3,9 @@
   python main.py new DIR [settings]   # create an experiment: save its settings (dataset, model, optimizer, start, ...) to DIR/config.json
   python main.py train DIR [...]      # train the full model on all the data, with the logs (loss, metrics, norms, EMA; optionally Hessian eigenvalues, curvature along the gradient / tangent / EMA direction, tangent, test loss)
   python main.py retrain DIR [...]    # train models with perturbed training weights (data dropped / noised), vmapped together
-  python main.py magic DIR [...]      # train on all the data and compute df/dw for each eval set (--gn: Gauss-Newton; --perturb-steps: only the first steps)
+  python main.py magic DIR [...]      # compute df/dw of the trained full model for each eval set (--gn: Gauss-Newton; --perturb-steps: only the first steps)
   python main.py prune DIR [...]      # delete the saved states (the retrained and full models' *.pt) to free disk space, keeping everything else (DIR: an experiment or a dir of them)
-The three are independent (each only needs DIR/config.json); experiments/evaluate.py needs all of them.
+train and retrain are independent (each only needs DIR/config.json); magic needs train; experiments/evaluate.py needs all of them.
 
 Everything saved in DIR is comparable (same config, so same training and same steps `start`-`n_steps` perturbed, or only the
 first --perturb-steps of them: the retrained models and the magic dirs of the same --perturb-steps are compared).
@@ -13,12 +13,17 @@ A saved state (*.pt below) is `asdict(OptimState)`, loaded by `Experiment.load_s
   DIR/full_model/   start.pt (if start > 0): the state at step `start`, trained once on all the data, from which everything
                     continues; final.pt: the state after training on all the data (the retrained models' reference in
                     evaluate.py);
+                    checkpoints/<t>.pt (`train --checkpoint-every`): the state at the optimizer step t, from which `magic`
+                    replays the steps up to the next one; resume.pt: the logs at the last checkpoint of a killed `train`, which
+                    the next `train` continues from;
                     metrics.pt + plots: the logs of `train` (see `train_logged`)
   DIR/retrained/    one dir per retrained model: final.pt, perturbation.pt = {weights [N], kind, alpha, perturb_steps};
                     losses.json: its loss on every eval set evaluated so far (`Experiment.eval_losses`, also in DIR/full_model:
                     the evaluations and fits read it instead of the state, so `prune` can delete the states)
   DIR/magic/        one dir per eval set: linearization.pt = {indices [n] (test examples), output f, beta df/dw [N]};
-                    metrics.pt + plots: the norms of df/ds_t and df/dw_t of the last `magic` call
+                    metrics.pt + plots: the norms of df/ds_t and df/dw_t of the last `magic` call;
+                    resume.pt: df/ds_t and df/dw so far at the last checkpoint a killed `magic` reached, which the next
+                    `magic` of the same eval sets continues from
   DIR/magic[_gn][_steps<k>]/  the same with `magic --gn` (the Gauss-Newton matrix in the backward) / `--perturb-steps k`
                     (see `magic_dirname`; evaluated into DIR/evaluation[_gn])
   DIR/fit[_steps<k>]/  the same layout from experiments/fit.py: df/dw fitted by linear regression on the retrained models,
@@ -32,6 +37,7 @@ train skips an existing full model unless --force. experiments/ compares them (e
 
 import hashlib
 import json
+import shutil
 import click
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -49,6 +55,11 @@ from src.utils import LOSSES, dict_zip, hvp_from_grads, metrics
 from src.models import MODELS
 from src.optimizers import AdamState, CentralFlowState, EdgeFlowState, HeunState, LRSchedule, NewtonState, OptimState, SecondOrderState, SGDMomentumState, SGDState, SharpnessState
 from src.logging import Logger, fig_title, op_norm
+
+
+def parse_devices(device: str) -> list[str]:
+    """--device: "cpu", "cuda", or a number of GPUs ("8" -> cuda:0, ..., cuda:7)"""
+    return [f"cuda:{i}" for i in range(int(device))] if device.isdigit() else device.split(",")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -96,6 +107,7 @@ class Experiment:
                 saved.pop(removed, None)
             self.cfg = ExperimentConfig(**saved)
         torch.set_default_dtype(DTYPES[self.cfg.dtype])
+        self.device, *self.helper_devices = parse_devices(self.device)
 
     @property
     def name(self) -> str:
@@ -175,7 +187,7 @@ class Experiment:
         if cfg.optimizer == "edgeflow":
             return EdgeFlowState(params=params, lr=schedule, wd=cfg.weight_decay)
         if cfg.optimizer == "centralflow":
-            return CentralFlowState(params=params, lr=schedule, wd=cfg.weight_decay)
+            return CentralFlowState(params=params, lr=schedule, wd=cfg.weight_decay, compile=self.compile, devices=tuple(self.helper_devices))
         if cfg.optimizer == "heun":
             return HeunState(params=params, lr=schedule, wd=cfg.weight_decay)
         assert cfg.optimizer == "sgd", cfg.optimizer
@@ -201,7 +213,18 @@ class Experiment:
 
     def load_state(self, path: Path) -> OptimState:
         """A state saved as `asdict(state)` (on CPU)."""
-        return type(self.init_state)(**torch.load(path, weights_only=True))
+        saved = torch.load(path, weights_only=True)
+        if "compile" in saved:
+            saved["compile"] = self.compile
+        if "devices" in saved:
+            saved["devices"] = tuple(self.helper_devices)
+        return type(self.init_state)(**saved)
+
+    def checkpoints(self) -> dict[int, Path]:
+        """The optimizer steps strictly inside the training with a saved state (DIR/full_model/checkpoints), in order"""
+        start, n_steps = self.steps
+        paths = {int(path.stem): path for path in (self.dir / "full_model" / "checkpoints").glob("*.pt")}
+        return {t: paths[t] for t in sorted(paths) if start < t < start + n_steps}
 
     def eval_losses(self, model_dir: Path, eval_sets: list[Tensor], extra_step: bool = False) -> Tensor:
         """The loss of the model model_dir/final.pt (DIR/full_model or DIR/retrained/<run>) on each eval set (test indices)
@@ -249,10 +272,24 @@ def eig_cos(d: dict[str, Tensor], eigvecs: dict[str, Tensor]) -> Tensor:
     return cos.abs() if batched else cos.abs()[0]
 
 
+def to_device(tensors, device):
+    """The nested dicts / lists / states `tensors` with every tensor on `device`"""
+    if isinstance(tensors, Tensor):
+        return tensors.to(device)
+    if isinstance(tensors, OptimState):
+        return tensors.apply(lambda t: t.to(device))
+    if isinstance(tensors, dict):
+        return {k: to_device(v, device) for k, v in tensors.items()}
+    if isinstance(tensors, list):
+        return [to_device(v, device) for v in tensors]
+    return tensors
+
+
 def train_logged(
     magic: Magic, init_state: OptimState, *, n_steps: int, start: int = 0, test_loader: Loader, logger: Logger,
     n_top_eigs: int = 0, n_neg_eigs: int = 0, eig_every: int = 10, curvature: bool = False, tangent: bool = False,
     eval_every: int = 100, n_test: int | None = None, ema_gamma: float | None = None, ema_decay: float | None = None,
+    checkpoint_every: int = 0, save_dir: Path | None = None,
 ) -> OptimState:
     """Train the full model (`Magic.train` with its own logs: loss, metrics, op norms of the params and grads, the step's stats)
     with more logs from the states and gradients it yields. By default only the ones that need no second derivative:
@@ -272,6 +309,8 @@ def train_logged(
       `ema_decay`, kept here too), every `eig_every` steps, one HVP each (vHv of the gradient: the batch sharpness)
     - "tangent": the norms of ds_t/ds_0 v for a random v, propagated by forward-mode AD through the training (the loss gradient
       and the step), for any optimizer
+    `checkpoint_every`: save the state to `save_dir`/checkpoints/<t>.pt every this many steps, and the logs so far to
+    `save_dir`/resume.pt. If `save_dir`/resume.pt exists, the training continues from it.
     Returns the trained state."""
     second_order = {1: "sharpness"} if isinstance(init_state, (SharpnessState, EdgeFlowState)) \
         else {-1: "min_eig"} if isinstance(init_state, NewtonState) \
@@ -333,12 +372,28 @@ def train_logged(
         if not isinstance(P, Tensor) or P.ndim == 0:
             logger.log(t, **{"eig/threshold": torch.as_tensor(eos / P, dtype=torch.get_default_dtype())})
 
+    first = start  # the step the training (re)starts from
+    if save_dir is not None and (save_dir / "resume.pt").exists():
+        resume = torch.load(save_dir / "resume.pt", weights_only=True)
+        first, ema, pema, warm = resume["step"], resume["ema"], resume["pema"], resume["warm"]
+        logger.restore(resume["metrics"])
+        saved = torch.load(save_dir / "checkpoints" / f"{first}.pt", weights_only=True)
+        init_state = replace(init_state, **{group: saved[group] for group in (*init_state.groups, *init_state.aux)})
+        if v is not None:
+            v = init_state.unflatten(resume["tangent"])
+        ema, pema, warm, v = (to_device(tensors, magic.device) for tensors in (ema, pema, warm, v))
+
     create_graph = bool(ks) or curvature
     try:
-        trace = magic.train.trace(init_state, n_steps=n_steps, start=start, log=logger, create_graph=create_graph, hook=hook)
+        trace = magic.train.trace(init_state, n_steps=start + n_steps - first, start=first, log=logger, create_graph=create_graph, hook=hook)
         for t, state, grads in trace:
             with fwAD._set_fwd_grad_enabled(False):  # the logging computes no tangents (the state and grads are duals if `tangent`)
                 params = {k: p.detach() for k, p in state.params.items()}
+                if checkpoint_every and save_dir is not None and t > first and grads is not None and (t - start) % checkpoint_every == 0:
+                    (save_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+                    torch.save(asdict(state.apply(lambda s: fwAD.unpack_dual(s).primal.detach().cpu())), save_dir / "checkpoints" / f"{t}.pt")
+                    resume = {"step": t, "metrics": logger.metrics(), "ema": ema, "pema": pema, "warm": warm, "tangent": None if v is None else list(v)}
+                    torch.save(to_device(resume, "cpu"), save_dir / "resume.pt")
                 X, Y, _ = magic.loader.get_batch(t)
                 if state.lr.kind != "constant" or state.lr.warmup:
                     logger.log(t, lr=torch.tensor(state.lr(t)))
@@ -429,7 +484,7 @@ perturb_steps_option = click.option("--perturb-steps", type=int, default=None, h
 
 
 exp_dir = click.argument("exp_dir", type=click.Path(path_type=Path, file_okay=False))
-device_option = click.option("--device", type=str, default="cpu", show_default=True, help="retrain: several, comma-separated (cuda:0,cuda:1), split the models among a process each")
+device_option = click.option("--device", type=str, default="cpu", show_default=True, help="cpu, cuda, or a number of GPUs (8): retrain trains the models in a process per GPU; centralflow splits the pairs of critical eigenvectors of each step of the magic backward among them")
 compile_option = click.option("--compile/--no-compile", default=False, help="torch.compile the model forward of the training passes (train: only without second derivatives)")
 show_option = click.option("--show/--no-show", default=True, help="show the plots")
 
@@ -471,7 +526,7 @@ def new(exp_dir: Path, **kwargs):
 
 
 @main.command(help="Train the full model on all the data from step `start`, with the logs (see `train_logged`), into DIR/full_model: "
-              "final.pt, metrics.pt and plots. Skipped if final.pt exists, unless --force. By default only the logs that need no second "
+              "final.pt, metrics.pt and plots. Skipped if final.pt exists, unless --force; a killed run continues from its last checkpoint (--checkpoint-every). By default only the logs that need no second "
               "derivative (and so allow --compile): the eigenvalues, curvature and tangent are opt-in.")
 @exp_dir
 @device_option
@@ -486,23 +541,31 @@ def new(exp_dir: Path, **kwargs):
 @click.option("--n-test", type=int, default=10_000, show_default=True, help="test examples (a fresh random subset at each eval, the whole test set at the last step) the test loss is logged on (0: always the whole test set)")
 @click.option("--ema-gamma", type=float, default=20, show_default=True, help="also log the loss and metrics of the power-function EMA of the params (Karras et al. 2024) with this exponent: 16.97 averages the last ~5% of the training (0: don't)")
 @click.option("--ema-decay", type=float, default=0.9, show_default=True, help="short-term EMA of the params with this decay, the direction params - EMA of --curvature (0: don't)")
+@click.option("--checkpoint-every", type=int, default=0, show_default=True, help="save the state every this many steps (0: don't): a killed train continues from the last one, and magic replays only between them")
 @show_option
-def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every, curvature, tangent, eval_every, n_test, ema_gamma, ema_decay, show):
+def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every, curvature, tangent, eval_every, n_test, ema_gamma, ema_decay, checkpoint_every, show):
     exp = Experiment(exp_dir, device, compile)
-    cfg = exp.cfg
     full_dir = exp_dir / "full_model"
     if (full_dir / "final.pt").exists() and not force:
         click.echo(f"{full_dir / 'final.pt'} exists (--force to retrain)")
         return
+    if force:
+        shutil.rmtree(full_dir / "checkpoints", ignore_errors=True)
+        for name in ("final.pt", "resume.pt"):
+            (full_dir / name).unlink(missing_ok=True)
+    if (full_dir / "resume.pt").exists():
+        click.echo(f"continuing from the last checkpoint ({full_dir / 'resume.pt'})")
     logger = Logger(exp.name, step_scale=exp.substeps, lags=())
     start, n_steps = exp.steps
     final = train_logged(
         exp.magic, exp.start_state, n_steps=n_steps, start=start, test_loader=exp.test_loader, logger=logger,
         n_top_eigs=num_top_eigs, n_neg_eigs=num_neg_eigs, eig_every=eig_every, curvature=curvature, tangent=tangent,
         eval_every=eval_every, n_test=n_test or None, ema_gamma=ema_gamma or None, ema_decay=ema_decay or None,
+        checkpoint_every=checkpoint_every * exp.substeps, save_dir=full_dir,
     )
     full_dir.mkdir(parents=True, exist_ok=True)
     torch.save(asdict(final), full_dir / "final.pt")
+    (full_dir / "resume.pt").unlink(missing_ok=True)
     logger.finish(full_dir / "metrics.pt")
     click.echo(f"saved {full_dir / 'final.pt'} and {full_dir / 'metrics.png'}")
     if show:
@@ -512,7 +575,7 @@ def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every
 
 @main.command(help="Train --n-subsets models with the training weights perturbed from step `start` on, into DIR/retrained: dropping a "
               "random --alpha fraction of the data (--kind drop), or adding N(0, alpha) to every weight (--kind randn; same ||w - 1|| as drop), "
-              "vmapped together (first-order optimizers), on several GPUs at once with --device cuda:0,cuda:1,.... With --perturb-steps k (randn only), the weights are perturbed for the first k steps alone and the "
+              "vmapped together (first-order optimizers), on several GPUs at once with --device <number of GPUs>. With --perturb-steps k (randn only), the weights are perturbed for the first k steps alone and the "
               "training continues on all the data (dirs steps<k>_<kind>_<alpha>_<i>). Existing models are skipped.")
 @exp_dir
 @device_option
@@ -525,7 +588,7 @@ def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every
 def retrain(exp_dir, device, compile, kind, alphas, n_subsets, vmap_limit, perturb_steps):
     if perturb_steps is not None and kind != "randn":
         raise click.UsageError("--perturb-steps is only allowed with --kind randn")
-    devices = device.split(",")
+    devices = parse_devices(device)
     if len(devices) == 1:
         return retrain_shard(exp_dir, device, compile, kind, alphas, n_subsets, vmap_limit, perturb_steps)
     Experiment(exp_dir, devices[0], compile).start_state  # (saved, so that the processes don't each train it)
@@ -594,47 +657,64 @@ def plot_examples(exp: Experiment, subset_dir: Path, k: int = 5, method: str = "
     fig.savefig(subset_dir / "examples.png", dpi=150)
 
 
-@main.command(help="Train on all the data and compute df/dw (MAGIC) for the loss f on each eval set after training, "
+@main.command(help="Compute df/dw (MAGIC) for the loss f of the trained full model (`train` first) on each eval set, "
               "for the training weights of the steps from `start` on (--perturb-steps k: of the first k only; df/ds_t still goes through the "
               "later steps). Saves to DIR/magic[_gn][_steps<k>] (linearization.pt per eval set; metrics.pt and "
               "plots of f(s_t), the norms of df/ds_t and df/dw_t; per eval set, examples.png: its images and the training images with the "
-              "lowest / highest df/dw); existing eval sets are skipped.")
+              "lowest / highest df/dw); existing eval sets are skipped. The backward goes from each checkpoint of `train` to the next, "
+              "and a killed run continues from the last one it reached.")
 @exp_dir
 @device_option
 @compile_option
 @click.option("--n-test", type=int, default=1, show_default=True, help="test examples in each eval set (a fixed random subset): f is their mean loss")
 @click.option("--n-subsets", type=int, default=1, show_default=True, help="eval sets (indices 0, ..., n-1)")
-@click.option("--passes", type=int, default=2, show_default=True, help="re-trainings to reconstruct the states in reverse (memory: passes * steps^(1/passes) states)")
-@click.option("--vmap-limit", type=int, default=None, help="backpropagate at most this many eval sets at a time, a replay each (default: all at once; only the first chunk is logged)")
+@click.option("--passes", type=int, default=2, show_default=True, help="re-trainings to reconstruct the states between two checkpoints in reverse (memory: passes * steps^(1/passes) states)")
 @gn_option
 @perturb_steps_option
 @show_option
-def magic(exp_dir, device, compile, n_test, n_subsets, passes, vmap_limit, gn, perturb_steps, show):
+def magic(exp_dir, device, compile, n_test, n_subsets, passes, gn, perturb_steps, show):
     exp = Experiment(exp_dir, device, compile)
     perturbed = perturbed_steps(exp, perturb_steps)
     start, n_steps = exp.steps
+    final_path = exp_dir / "full_model" / "final.pt"
+    if not final_path.exists():
+        raise click.UsageError(f"no trained model {final_path}: run `python main.py train` first")
     magic_dir = exp_dir / magic_dirname(gn, perturb_steps)
     dirs = {i: magic_dir / f"{n_test}_examples_{i}" for i in range(n_subsets)}  # index -> dir
     todo = {i: d for i, d in dirs.items() if not (d / "linearization.pt").exists()}
     if todo:
         indices = [exp.test_ds.subset(n_test, index=i) for i in todo]  # the test examples of each eval set
-        limit = vmap_limit or len(todo)
-        click.echo(f"backpropagating {len(todo)} eval sets" + (f" in chunks of {limit}" if limit < len(todo) else ""))
+        click.echo(f"backpropagating {len(todo)} eval sets")
         logger = Logger(f"{magic_title(gn, perturb_steps)}: df/ds_t and df/dw_t; {exp.name}", smooth=False, split_norms=True, step_scale=exp.substeps)
         eval_sets = [exp.test_ds.examples(idx) for idx in indices]
-        outputs, betas = [], []  # per chunk: f(s_T) [#fns], df/dw [#fns, N]
-        for c in range(0, len(eval_sets), limit):
-            output, beta = exp.magic.backprop(
-                exp.start_state, n_steps=n_steps, start=start, eval_sets=eval_sets[c:c + limit],
-                passes=passes, gn=gn, perturbed=perturbed, log=logger if c == 0 else None,
+        outputs, delta = exp.magic.eval_grads(exp.load_state(final_path), eval_sets)  # f(s_T) [#fns], df/ds_T
+        betas = torch.zeros(len(todo), len(exp.train_ds))  # df/dw [#fns, N]
+        checkpoints = exp.checkpoints()
+        bounds = [start, *checkpoints, start + n_steps]
+        resume_path, names = magic_dir / "resume.pt", [d.name for d in todo.values()]
+        if resume_path.exists() and (resume := torch.load(resume_path, weights_only=True))["eval_sets"] == names:
+            click.echo(f"continuing from step {resume['step']} ({resume_path})")
+            delta, betas = delta.unflatten(resume["delta"]), resume["betas"]
+            bounds = [t for t in bounds if t <= resume["step"]]
+            logger.restore(resume["metrics"])
+        for seg_start, seg_stop in reversed(list(zip(bounds, bounds[1:]))):
+            if seg_stop <= perturbed.start:
+                break
+            init_state = exp.load_state(checkpoints[seg_start]) if seg_start in checkpoints else exp.start_state
+            delta, seg_betas = exp.magic.backprop(
+                init_state, delta, n_steps=seg_stop - seg_start, start=seg_start, passes=passes, gn=gn, perturbed=perturbed,
+                eval_sets=eval_sets, log=logger,
             )
-            outputs.append(output.cpu())
-            betas.append(beta.cpu())
-        for (i, d), idx, output, beta in zip(todo.items(), indices, torch.cat(outputs), torch.cat(betas)):
+            betas += seg_betas.cpu()
+            magic_dir.mkdir(parents=True, exist_ok=True)
+            torch.save({"step": seg_start, "eval_sets": names, "delta": [d.cpu() for d in delta], "betas": betas,
+                        "metrics": logger.metrics()}, resume_path)
+        for (i, d), idx, output, beta in zip(todo.items(), indices, outputs, betas):
             d.mkdir(parents=True, exist_ok=True)
-            torch.save({"indices": idx, "output": output.cpu(), "beta": beta.cpu()}, d / "linearization.pt")
+            torch.save({"indices": idx, "output": output.cpu(), "beta": beta}, d / "linearization.pt")
             click.echo(f"  {n_test} examples #{i}: f = {output.item():.4f}")
         logger.finish(magic_dir / "metrics.pt")
+        resume_path.unlink()
     for d in dirs.values():
         plot_examples(exp, d)
     if show:
@@ -642,12 +722,12 @@ def magic(exp_dir, device, compile, n_test, n_subsets, passes, vmap_limit, gn, p
     plt.close("all")
 
 
-@main.command(help="Delete the saved states of DIR (DIR/retrained/*/final.pt and DIR/full_model/{start,final}.pt, almost all of its "
+@main.command(help="Delete the saved states of DIR (DIR/retrained/*/final.pt, DIR/full_model/{start,final}.pt and its checkpoints, almost all of its "
                    "disk usage) to free disk space, keeping the perturbations, df/dw, metrics, plots, evaluations and the losses "
                    "saved by them (losses.json: the evaluations and fits of the same eval sets still run; others need the states again). "
                    "A DIR without config.json is a dir of experiments: each subdir with a config.json is pruned.")
 @exp_dir
-@click.option("--keep-full-model/--no-keep-full-model", default=False, help="keep DIR/full_model/{start,final}.pt (a few MB)")
+@click.option("--keep-full-model/--no-keep-full-model", default=False, help="keep DIR/full_model/{start,final}.pt and its checkpoints")
 @click.option("--dry-run/--no-dry-run", default=False, help="only list what would be deleted")
 @click.option("--yes/--no-yes", "-y", default=False, help="don't ask for confirmation")
 def prune(exp_dir: Path, keep_full_model: bool, dry_run: bool, yes: bool):
@@ -659,6 +739,7 @@ def prune(exp_dir: Path, keep_full_model: bool, dry_run: bool, yes: bool):
         paths += sorted((d / "retrained").glob("*/final.pt"))
         if not keep_full_model:
             paths += [p for p in (d / "full_model" / "start.pt", d / "full_model" / "final.pt") if p.exists()]
+            paths += sorted((d / "full_model" / "checkpoints").glob("*.pt"))
     size = sum(p.stat().st_size for p in paths)
     if not paths:
         click.echo(f"no saved states in {exp_dir}")

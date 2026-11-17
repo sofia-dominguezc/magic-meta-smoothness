@@ -51,7 +51,8 @@ def torch_lobpcg(
         n_iter += 1
         R = _project_out(torch.cat((X, P), dim=1), R)
         XPR = torch.cat((X, P, R), dim=1)
-        theta, Q = _rayleigh_ritz_orth(A, XPR)
+        A_XPR = A(XPR)
+        theta, Q = _eigh_ascending(XPR.T @ A_XPR)
         theta = theta[:k]
         B = Q[:, :k]
         normB = torch.linalg.norm(B, ord=2, dim=0, keepdim=True)
@@ -64,7 +65,7 @@ def torch_lobpcg(
         P = XPR @ diff_rayleigh_ortho
         normP = torch.linalg.norm(P, ord=2, dim=0, keepdim=True)
         P /= torch.where(normP == 0, 1.0, normP)
-        AX = A(X)
+        AX = A_XPR @ B / normX  # = A(X)
         R = AX - theta[None, :] * X
         resid_norms = torch.linalg.norm(R, ord=2, dim=0)
         # |theta| (JAX: theta): on an indefinite operator a negative Ritz value would make the bound ~0
@@ -83,11 +84,6 @@ def _project_out(basis, U):
     U *= normU >= 0.99
 
     return U
-
-def _rayleigh_ritz_orth(A, S):
-    SAS = S.T @ A(S)
-    return _eigh_ascending(SAS)
-
 
 def _orthonormalize(basis):
     for _ in range(2):

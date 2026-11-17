@@ -29,7 +29,7 @@ def test_cli_end_to_end(tmp_path):
         ["retrain", d, "--kind", "drop", "--alpha", "0.025", "--n-subsets", "4"],  # 2 new models
         ["train", d, "--num-top-eigs", "2", "--num-neg-eigs", "1", "--eig-every", "2", "--eval-every", "4", "--n-test", "50", "--ema-decay", "0.9", "--curvature", "--no-show"],
         ["train", d, "--no-show"],  # exists: skipped
-        ["magic", d, "--n-test", "5", "--n-subsets", "2", "--vmap-limit", "1", "--no-show"],  # 2 eval sets in 2 chunks
+        ["magic", d, "--n-test", "5", "--n-subsets", "2", "--no-show"],  # 2 eval sets
         ["magic", d, "--n-test", "5", "--n-subsets", "3", "--no-show"],  # one new eval subset
         ["magic", d, "--n-test", "20", "--no-show"],  # another size (4 eval fns in all)
         ["magic", d, "--n-test", "5", "--no-show"],  # nothing new
@@ -191,7 +191,7 @@ def test_centralflow(tmp_path):
         result = runner.invoke(main, args, catch_exceptions=False)
         assert result.exit_code == 0, result.output
     final = torch.load(tmp_path / "full_model" / "final.pt", weights_only=True)
-    assert set(final) == {"params", "lr", "wd", "eigvecs", "stats"}
+    assert set(final) == {"params", "lr", "wd", "eigvecs", "stats", "compile", "devices"}
     assert all(v.shape == (4, *final["params"][k].shape) for k, v in final["eigvecs"].items())
     logged = torch.load(tmp_path / "full_model" / "metrics.pt", weights_only=True)
     n_substeps = 4 * CentralFlowState.SUBSTEPS
@@ -295,3 +295,58 @@ def test_perturb_steps(tmp_path):
     assert torch.equal(torch.load(fit(tmp_path, n_test=5, n_subsets=2, perturb_steps=2, folds=0, show=False) / "5_examples_1" / "linearization.pt", weights_only=True)["beta"], lin_fit["beta"])
     with pytest.raises(click.UsageError, match="pruned"):  # an eval set never evaluated needs the states
         fit(tmp_path, n_test=3, n_subsets=1, perturb_steps=2, show=False)
+
+
+def test_checkpoints_and_resume(tmp_path, monkeypatch):
+    """`train --checkpoint-every` saves the states magic backpropagates between, and a train / magic killed after a
+    checkpoint continues from it: the same final state, logs and df/dw as the plain run."""
+    from src.data import Loader
+    runner = CliRunner()
+    new = ["--dataset", "majority", "--model", "mlp", "--width", "16", "--optimizer", "momentum", "--lr", "0.1", "--n-steps", "8", "--dtype", "fp64"]
+    train = ["--num-top-eigs", "2", "--eig-every", "2", "--eval-every", "4", "--n-test", "20", "--tangent", "--no-show"]
+    plain, killed = tmp_path / "plain", tmp_path / "killed"
+    for args in [["new", str(plain), *new], ["train", str(plain), *train], ["magic", str(plain), "--n-test", "5", "--n-subsets", "2", "--no-show"],
+                 ["new", str(killed), *new]]:
+        result = runner.invoke(main, args, catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+
+    get_batch = Loader.get_batch
+    def kill_at(step):
+        def killed_get_batch(self, t):
+            if t == step:
+                raise RuntimeError("killed")
+            return get_batch(self, t)
+        monkeypatch.setattr(Loader, "get_batch", killed_get_batch)
+
+    kill_at(7)
+    with pytest.raises(RuntimeError, match="killed"):
+        runner.invoke(main, ["train", str(killed), *train, "--checkpoint-every", "3"], catch_exceptions=False)
+    assert sorted(p.name for p in (killed / "full_model" / "checkpoints").iterdir()) == ["3.pt", "6.pt"]
+    assert torch.load(killed / "full_model" / "resume.pt", weights_only=True)["step"] == 6 and not (killed / "full_model" / "final.pt").exists()
+    with pytest.raises(click.UsageError, match="train"):
+        runner.invoke(main, ["magic", str(killed), "--no-show"], catch_exceptions=False, standalone_mode=False)
+    monkeypatch.setattr(Loader, "get_batch", get_batch)
+    result = runner.invoke(main, ["train", str(killed), *train, "--checkpoint-every", "3"], catch_exceptions=False)
+    assert result.exit_code == 0 and "continuing" in result.output, result.output
+    assert not (killed / "full_model" / "resume.pt").exists()
+    final, ref = (torch.load(d / "full_model" / "final.pt", weights_only=True) for d in (killed, plain))
+    torch.testing.assert_close((final["params"], final["buffer"]), (ref["params"], ref["buffer"]), rtol=0, atol=0)
+    logged, ref = (torch.load(d / "full_model" / "metrics.pt", weights_only=True) for d in (killed, plain))
+    assert {"eig/1", "test_loss/ema", "tangent/params/out.weight"} <= set(logged)
+    torch.testing.assert_close(logged, ref, rtol=0, atol=0)
+
+    magic_args = ["magic", str(killed), "--n-test", "5", "--n-subsets", "2", "--passes", "1", "--no-show"]
+    kill_at(1)  # in the last segment (steps 0-2)
+    with pytest.raises(RuntimeError, match="killed"):
+        runner.invoke(main, magic_args, catch_exceptions=False)
+    assert torch.load(killed / "magic" / "resume.pt", weights_only=True)["step"] == 3
+    monkeypatch.setattr(Loader, "get_batch", get_batch)
+    result = runner.invoke(main, magic_args, catch_exceptions=False)
+    assert result.exit_code == 0 and "continuing from step 3" in result.output, result.output
+    assert not (killed / "magic" / "resume.pt").exists()
+    for i in range(2):
+        lin, ref = (torch.load(d / "magic" / f"5_examples_{i}" / "linearization.pt", weights_only=True) for d in (killed, plain))
+        torch.testing.assert_close(lin, ref)
+    logged, ref = (torch.load(d / "magic" / "metrics.pt", weights_only=True) for d in (killed, plain))
+    assert logged["f/0"]["step"].tolist() == ref["f/0"]["step"].tolist() == list(range(7, -1, -1))
+    torch.testing.assert_close(logged["d_weights/1"]["value"], ref["d_weights/1"]["value"])

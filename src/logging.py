@@ -156,6 +156,10 @@ class Logger:
             for k, v in self._history.items()
         }
 
+    def restore(self, metrics: dict[str, dict[str, Tensor]]):
+        """Start from the saved `metrics()` of a killed run"""
+        self._history = defaultdict(list, {k: [(m["step"].tolist(), m["value"])] for k, m in metrics.items()})
+
     def finish(self, path: Path):
         """Save the logged metrics to `path` (see `metrics`) and plot them next to it:
         - <path>.png: the scalars, one panel per panel name (EMA-smoothed in step time when there are enough points)

@@ -40,6 +40,12 @@ def setup(optimizer: str, **kwargs):
     return magic, train_ds, Loader(test_ds, batch_size=7), state  # eval sets of several batches
 
 
+def backprop(magic, state, n_steps, eval_sets, **kwargs):
+    """(f(s_T), df/dw) of the training of `n_steps` steps from `state`"""
+    outputs, delta = magic.eval_grads(magic.train(state, n_steps=n_steps, pbar=False), eval_sets)
+    return outputs, magic.backprop(state, delta, n_steps=n_steps, eval_sets=eval_sets, **kwargs)[1]
+
+
 def weighted_loss(magic, X, Y, w):
     """The `forward_fn` of a batch with the example weights `w`"""
     return lambda p: ((w * cross_entropy(functional_call(magic.model, p, (X,)), Y)).mean(), None)
@@ -49,11 +55,10 @@ def weighted_loss(magic, X, Y, w):
 @pytest.mark.parametrize("n_steps", [1, 4, 11, 27])  # n_steps^(1/passes) exact, and not (uneven last chunk)
 def test_replay_reconstructs_training(n_steps, passes):
     magic, _, _, state = setup("momentum")
-    forward = [s.apply(lambda t: t.clone()) for _, s, _ in magic.train.trace(state, n_steps=n_steps)]
-    final = forward.pop()
+    forward = [s.apply(lambda t: t.clone()) for _, s, _ in magic.train.trace(state, n_steps=n_steps)][:-1]  # (not the final state)
     replayed = list(magic.replay(state, n_steps=n_steps, passes=passes))
-    assert len(replayed) == n_steps + 1
-    for a, b in zip([final, *reversed(forward)], replayed):
+    assert len(replayed) == n_steps
+    for a, b in zip(reversed(forward), replayed):
         for x, y in zip(a, b):
             assert torch.equal(x, y)
 
@@ -64,7 +69,7 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
     Rayleigh quotient of the detached eigenvector, the same expression)."""
     magic, train_ds, test_loader, state = setup(optimizer)
     n_steps, eval_sets = 11, [torch.arange(10), torch.arange(20, 50)]
-    outputs, betas = magic.backprop(state, n_steps=n_steps, eval_sets=[test_loader.dataset.examples(idx) for idx in eval_sets])
+    outputs, betas = backprop(magic, state, n_steps, [test_loader.dataset.examples(idx) for idx in eval_sets])
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -92,7 +97,7 @@ def test_centralflow_magic_matches_finite_differences(float64, monkeypatch):
     stats = [s.stats for _, s, _ in magic.train.trace(state, n_steps=n_steps, pbar=False)][1:]
     assert {int(s["n_critical"]) for s in stats} == {1, 2}
     assert any(s["oscillation"] > 0 for s in stats) and any(s["oscillation"] == 0 for s in stats)  # on and below the edge
-    _, betas = magic.backprop(state, n_steps=n_steps, eval_sets=eval_sets)
+    _, betas = backprop(magic, state, n_steps, eval_sets)
 
     direction, eps = torch.randn(len(train_ds), generator=torch.Generator().manual_seed(0)), 1e-6
     finals = [magic.train(state, n_steps=n_steps, weights=1 + sign * eps * direction, pbar=False) for sign in (1, -1)]
@@ -129,7 +134,7 @@ def test_lr_schedule(optimizer, float64):
     assert lrs[0] == lr / 2 and lrs[1] == lrs[2] == lr and lr > lrs[3] > lrs[4] > lrs[5] == pytest.approx(LRSchedule.FINAL_FRACTION * lr)
     assert type(state)(**asdict(state)).lr == state.lr  # survives a save
     final = magic.train(state, n_steps=n_steps)
-    outputs, betas = magic.backprop(state, n_steps=n_steps, eval_sets=[test_loader.dataset.examples(torch.arange(10))])
+    outputs, betas = backprop(magic, state, n_steps, [test_loader.dataset.examples(torch.arange(10))])
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -202,8 +207,30 @@ def test_tangent_matches_finite_differences(float64, optimizer):
 def test_magic_does_not_modify_init_state():
     """On CPU `.to()` doesn't copy, so the replayed s_0 shares tensors with `init_state`."""
     magic, _, test_loader, state = setup("momentum")
-    magic.backprop(state, n_steps=4, eval_sets=[test_loader.dataset.examples(torch.arange(10))])
+    backprop(magic, state, 4, [test_loader.dataset.examples(torch.arange(10))])
+    backprop(magic, state, 1, [test_loader.dataset.examples(torch.arange(10))])  # (replays `init_state` itself)
     assert not any(t.requires_grad for t in state)
+
+
+@pytest.mark.parametrize("passes", [1, 2])
+def test_backprop_in_segments(passes, float64):
+    """Backpropagating from checkpoint to checkpoint (each segment from the delta the next one returns) = in one go."""
+    magic, _, test_loader, state = setup("momentum")
+    eval_sets = [test_loader.dataset.examples(idx) for idx in (torch.arange(10), torch.arange(20, 50))]
+    bounds = [0, 3, 4, 9]
+    states = {0: state}
+    for a, b in zip(bounds, bounds[1:]):
+        states[b] = magic.train(states[a], n_steps=b - a, start=a, pbar=False)
+    outputs, delta = magic.eval_grads(states[9], eval_sets)
+    whole_delta, whole = magic.backprop(state, delta, n_steps=9)
+    betas = torch.zeros_like(whole)
+    for a, b in reversed(list(zip(bounds, bounds[1:]))):
+        delta, segment_betas = magic.backprop(states[a], delta, n_steps=b - a, start=a, passes=passes)
+        betas += segment_betas
+    torch.testing.assert_close(betas, whole)
+    for a, b in zip(delta, whole_delta):
+        torch.testing.assert_close(a, b)
+    torch.testing.assert_close(outputs, backprop(magic, state, 9, eval_sets)[0])
 
 
 @pytest.mark.parametrize("negative", [False, True])
@@ -346,8 +373,9 @@ def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     magic, test_loader = Magic(model=model, loader=Loader(train_ds, batch_size=4), loss_fn=cross_entropy), Loader(test_ds)
     train_logged(magic, state, n_steps=5, test_loader=test_loader, logger=logger, eval_every=2, n_top_eigs=2, eig_every=2, tangent=True)  # eigs at step 4
     eval_sets = [test_loader.dataset.examples(torch.arange(8))]
-    outputs, betas = magic.backprop(state, n_steps=3, eval_sets=eval_sets, log=logger)
-    for t, _, delta, d_weights in magic.backprop.trace(state, n_steps=3, eval_sets=eval_sets):
+    outputs, betas = backprop(magic, state, 3, eval_sets, log=logger)
+    delta = magic.eval_grads(magic.train(state, n_steps=3), eval_sets)[1]
+    for t, _, delta, d_weights in magic.backprop.trace(state, delta, n_steps=3):
         assert d_weights.shape == (1, 4)
     logger.finish(tmp_path / "metrics.pt")
     metrics = torch.load(tmp_path / "metrics.pt", weights_only=True)
@@ -416,14 +444,15 @@ def test_gauss_newton_backprop_matches_exact_for_linear_model(float64):
     state = SGDState(params=params, lr=LRSchedule(0.1), wd=0.01)
     magic = Magic(model=model, loader=Loader(train_ds, batch_size=8, seed=3), loss_fn=mse)
     eval_sets = [test_ds.examples(torch.arange(10)), test_ds.examples(torch.arange(20, 50))]
-    outputs, betas = magic.backprop(state, n_steps=7, eval_sets=eval_sets)
-    outputs_gn, betas_gn = magic.backprop(state, n_steps=7, eval_sets=eval_sets, gn=True)
+    outputs, betas = backprop(magic, state, 7, eval_sets)
+    outputs_gn, betas_gn = backprop(magic, state, 7, eval_sets, gn=True)
+    final_delta = magic.eval_grads(magic.train(state, n_steps=7), eval_sets)[1]
     torch.testing.assert_close(outputs_gn, outputs)
     torch.testing.assert_close(betas_gn, betas)
     # perturbed steps 3-6 only: the steps t >= 3 are backpropagated as before, the steps t < 3 contribute nothing (df/ds_0 = 0)
     batches = [set(magic.loader.get_batch(t)[2].tolist()) for t in range(7)]
     kept = torch.tensor([not any(i in b for b in batches[:3]) for i in range(len(train_ds))])
-    trace = magic.backprop.trace(state, n_steps=7, eval_sets=eval_sets, gn=True, perturbed=range(3, 7))
+    trace = magic.backprop.trace(state, final_delta, n_steps=7, gn=True, perturbed=range(3, 7))
     steps = []
     try:
         while True:
@@ -434,7 +463,7 @@ def test_gauss_newton_backprop_matches_exact_for_linear_model(float64):
     torch.testing.assert_close(betas_late[:, kept], betas[:, kept])
     assert (betas_late[:, ~kept] == 0).all()
     # perturbed steps 0-1 only: df/ds_t goes through all the steps, df/dw_t is added for t < 2 alone
-    _, betas_early = magic.backprop(state, n_steps=7, eval_sets=eval_sets, perturbed=range(0, 2))
+    _, betas_early = backprop(magic, state, 7, eval_sets, perturbed=range(0, 2))
     early = torch.tensor([any(i in b for b in batches[:2]) for i in range(len(train_ds))])
     only_early = early & torch.tensor([not any(i in b for b in batches[2:]) for i in range(len(train_ds))])
     torch.testing.assert_close(betas_early[:, only_early], betas[:, only_early])
@@ -448,4 +477,4 @@ def test_gauss_newton_backprop_matches_exact_for_linear_model(float64):
         torch.testing.assert_close(d_grads[k], -state.lr(0) * d)
     with pytest.raises(AssertionError, match="only implemented for SGD"):
         momentum = SGDMomentumState(params=params, lr=LRSchedule(0.1))
-        magic.backprop(momentum, n_steps=2, eval_sets=eval_sets, gn=True)
+        backprop(magic, momentum, 2, eval_sets, gn=True)
