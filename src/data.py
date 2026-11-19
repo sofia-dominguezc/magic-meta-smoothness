@@ -26,6 +26,13 @@ class Dataset:
         self.ids, self.labels = self.ids[keep], self.labels[keep]
         self._cache = None
 
+    def limit_classes(self, n: int):
+        """Keep only the examples of the first `n` classes, in place (`out_dim` becomes n)."""
+        keep = (self.labels < n).nonzero().squeeze(1)
+        self.ids, self.labels = self.ids[keep], self.labels[keep]
+        self.out_dim = n
+        self._cache = None
+
     def to(self, device: torch.device | str | None):
         """Build all the examples once, X in the default dtype, and keep them on `device` (MNIST, CIFAR10: < 1.5 GB in
         fp64): `examples` then only indexes them."""

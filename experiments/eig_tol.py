@@ -40,7 +40,7 @@ def eig_tol(exp_dir: Path, device: str = "cpu", num_top_eigs: int = 2, num_neg_e
         if (t - start) % eig_every != 0 or t == start:  # (2nd-order states: no P at start)
             continue
         X, Y, _ = magic.loader.get_batch(t)
-        P, hvp_fn = state.precond(t), magic.hvp_fn(state.params, X, Y)
+        P, hvp_fn = state.precond(t), magic.objective.hvp_fn(state.params, X, Y)
         vals_t, iters_t = [], []
         for j, tol in enumerate(tols):
             vals_j, iters_j = [], []

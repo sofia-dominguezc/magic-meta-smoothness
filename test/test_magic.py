@@ -1,17 +1,20 @@
 from dataclasses import asdict, replace
+from functools import partial
 
 import pytest
 import torch
 from torch.func import functional_call
 
 from src.data import Dataset, Loader, Majority
+from src.objective import Objective, cross_entropy
 from src.lobpcg import hessian_eigs
 from src.magic import Magic
-from src.utils import cross_entropy, hvp_from_grads
+from src.utils import hvp_from_grads
 from src.models import MLP, Linear, ResNet, ViT
-from src.optimizers import AdamState, CentralFlowState, EdgeFlowState, HeunState, LRSchedule, NewtonState, SGDMomentumState, SGDState, SharpnessState
+from src.optimizers import AdamState, HeunState, LRSchedule, SGDMomentumState, SGDState
+from src.second_order import CentralFlowState, EdgeFlowState, NewtonState, SharpnessState
 from src.logging import Logger, op_norm
-from main import train_logged
+from main import backprop_logged, train_logged
 
 
 def setup(optimizer: str, **kwargs):
@@ -25,39 +28,41 @@ def setup(optimizer: str, **kwargs):
     elif optimizer == "momentum":
         state = SGDMomentumState(params=params, lr=LRSchedule(0.1), wd=0.01, momentum=0.9)
     elif optimizer == "heun":
-        state = HeunState(params=params, lr=LRSchedule(0.1), wd=0.01, alpha=0.75)
+        state = HeunState(params=params, lr=LRSchedule(0.1), wd=0.01, eps=0.5)
     elif optimizer == "sharpness":
         state = SharpnessState(params=params, lr=LRSchedule(1.0), wd=0.01)
     elif optimizer == "edgeflow":
         state = EdgeFlowState(params=params, lr=LRSchedule(0.5), wd=0.01)
-    elif optimizer == "centralflow":
-        state = CentralFlowState(params=params, lr=LRSchedule(1.0), wd=0.01)
+    elif optimizer == "centralflow":  # 4 warm-start vectors: several critical eigenvalues found at the first step (not one per step)
+        eigvecs = {k: torch.randn(4, *p.shape, generator=torch.Generator().manual_seed(0), dtype=p.dtype) for k, p in params.items()}
+        state = CentralFlowState(params=params, lr=LRSchedule(1.0), wd=0.01, eigvecs=eigvecs)
     elif optimizer == "newton":  # rtol: the implicit backward is compared with the unrolled one (equal up to it)
         state = NewtonState(params=params, lr=LRSchedule(1.0), wd=0.01, damping=1.0, rtol=1e-10)
     else:
         state = AdamState(params=params, lr=LRSchedule(0.01), wd=0.01)
-    magic = Magic(model=model, loader=Loader(train_ds, batch_size=8, seed=3), loss_fn=cross_entropy, **kwargs)
+    magic = Magic(objective=Objective(model=model, loss_fn=cross_entropy), loader=Loader(train_ds, batch_size=8, seed=3), **kwargs)
     return magic, train_ds, Loader(test_ds, batch_size=7), state  # eval sets of several batches
 
 
 def backprop(magic, state, n_steps, eval_sets, **kwargs):
     """(f(s_T), df/dw) of the training of `n_steps` steps from `state`"""
-    outputs, delta = magic.eval_grads(magic.train(state, n_steps=n_steps, pbar=False), eval_sets)
-    return outputs, magic.backprop(state, delta, n_steps=n_steps, eval_sets=eval_sets, **kwargs)[1]
+    final = magic.train(state, n_steps=n_steps, pbar=False)
+    outputs, f_grads = magic.objective.eval_grads(final.params, eval_sets)
+    return outputs, magic.backprop(state, final.cotangent(f_grads), n_steps=n_steps, **kwargs)[1]
 
 
 def weighted_loss(magic, X, Y, w):
     """The `forward_fn` of a batch with the example weights `w`"""
-    return lambda p: ((w * cross_entropy(functional_call(magic.model, p, (X,)), Y)).mean(), None)
+    return lambda p: ((w * cross_entropy(functional_call(magic.objective.model, p, (X,)), Y)).mean(), None)
 
 
 @pytest.mark.parametrize("passes", [1, 2, 3])
 @pytest.mark.parametrize("n_steps", [1, 4, 11, 27])  # n_steps^(1/passes) exact, and not (uneven last chunk)
 def test_replay_reconstructs_training(n_steps, passes):
     magic, _, _, state = setup("momentum")
-    forward = [s.apply(lambda t: t.clone()) for _, s, _ in magic.train.trace(state, n_steps=n_steps)][:-1]  # (not the final state)
+    forward = [s.apply(lambda t: t.clone()) for _, s, _ in magic.train.trace(state, n_steps=n_steps)]  # (with the final state)
     replayed = list(magic.replay(state, n_steps=n_steps, passes=passes))
-    assert len(replayed) == n_steps
+    assert len(replayed) == n_steps + 1
     for a, b in zip(reversed(forward), replayed):
         for x, y in zip(a, b):
             assert torch.equal(x, y)
@@ -69,7 +74,7 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
     Rayleigh quotient of the detached eigenvector, the same expression)."""
     magic, train_ds, test_loader, state = setup(optimizer)
     n_steps, eval_sets = 11, [torch.arange(10), torch.arange(20, 50)]
-    outputs, betas = backprop(magic, state, n_steps, [test_loader.dataset.examples(idx) for idx in eval_sets])
+    outputs, d_weights = backprop(magic, state, n_steps, [test_loader.dataset.examples(idx) for idx in eval_sets])
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -78,31 +83,48 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
         s = s.step(t, weighted_loss(magic, X, Y, w[idx]), create_graph=True)[0]
     for k, idx in enumerate(eval_sets):
         X, Y = test_loader.dataset.examples(idx)
-        f = cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean()
+        f = cross_entropy(functional_call(magic.objective.model, s.params, (X,)), Y).mean()
         (expected,) = torch.autograd.grad(f, w, retain_graph=True)
         torch.testing.assert_close(outputs[k], f.detach())
-        torch.testing.assert_close(betas[k], expected)
+        torch.testing.assert_close(d_weights[k], expected)
 
 
 def test_centralflow_magic_matches_finite_differences(float64, monkeypatch):
     """MAGIC through central flow steps on the edge of stability (the SDCP solution and the critical eigenvectors
-    differentiated implicitly) against central finite differences of the training in the example weights."""
+    differentiated implicitly) against central finite differences of the training in the example weights (rtol 1e-5: the
+    eigensolver's 1e-11 error, amplified by 1 / 2 eps)."""
     monkeypatch.setattr(CentralFlowState, "EIG_RTOL", 1e-11)
     monkeypatch.setattr(CentralFlowState, "VJP_RTOL", 1e-11)
     magic, train_ds, test_loader, state = setup("centralflow")
     X, Y, _ = magic.loader.get_batch(0)
-    sharpness = hessian_eigs(magic.hvp_fn(state.params, X, Y), state.eigvecs, rtol=1e-8)[0][0]
-    state = replace(state, lr=LRSchedule(2.1 / sharpness.item()))  # starts just above the edge 2 / lr
+    sharpness = hessian_eigs(magic.objective.hvp_fn(state.params, X, Y), state.eigvecs, rtol=1e-8)[0][0]
+    state = replace(state, lr=LRSchedule(6 / sharpness.item()))  # starts well above the edge 2 / lr: several critical eigenvalues
     n_steps, eval_sets = 8, [test_loader.dataset.examples(idx) for idx in (torch.arange(10), torch.arange(20, 50))]
     stats = [s.stats for _, s, _ in magic.train.trace(state, n_steps=n_steps, pbar=False)][1:]
-    assert {int(s["n_critical"]) for s in stats} == {1, 2}
-    assert any(s["oscillation"] > 0 for s in stats) and any(s["oscillation"] == 0 for s in stats)  # on and below the edge
-    _, betas = backprop(magic, state, n_steps, eval_sets)
+    n_critical = [int(s["n_critical"]) for s in stats]
+    assert min(n_critical) == 0 and max(n_critical) >= 3, n_critical  # below the edge too
+    _, d_weights = backprop(magic, state, n_steps, eval_sets)
 
-    direction, eps = torch.randn(len(train_ds), generator=torch.Generator().manual_seed(0)), 1e-6
-    finals = [magic.train(state, n_steps=n_steps, weights=1 + sign * eps * direction, pbar=False) for sign in (1, -1)]
-    finite_diff = torch.stack([magic.forward(finals[0].params, *e)[0] - magic.forward(finals[1].params, *e)[0] for e in eval_sets]) / (2 * eps)
-    torch.testing.assert_close(betas @ direction, finite_diff, rtol=1e-6, atol=0)
+    directions, eps = torch.randn(3, len(train_ds), generator=torch.Generator().manual_seed(0)), 1e-6
+    for direction in directions:
+        finals = [magic.train(state, n_steps=n_steps, weights=1 + sign * eps * direction, pbar=False) for sign in (1, -1)]
+        finite_diff = torch.stack([magic.objective.forward(finals[0].params, *e)[0] - magic.objective.forward(finals[1].params, *e)[0] for e in eval_sets]) / (2 * eps)
+        torch.testing.assert_close(d_weights @ direction, finite_diff, rtol=1e-5, atol=0)
+
+
+def test_centralflow_helper_devices_match_one(float64):
+    """A central flow step with helper devices (the pairs of critical eigenvectors dealt among the loss graphs) gives the
+    state of the step on one device."""
+    magic, _, _, state = setup("centralflow")
+    X, Y, _ = magic.loader.get_batch(0)
+    sharpness = hessian_eigs(magic.objective.hvp_fn(state.params, X, Y), state.eigvecs, rtol=1e-8)[0][0]
+    state = replace(state, lr=LRSchedule(6 / sharpness.item())).apply(lambda p: p.detach().requires_grad_())
+    forward_fn = partial(magic.objective.forward, X=X, Y=Y)
+    steps = [replace(state, devices=devices).step(0, forward_fn)[0] for devices in ((), ("cpu", "cpu"))]
+    assert int(steps[0].stats["n_critical"]) >= 3
+    for one_device, helped in zip(steps, steps[1:]):
+        for name in ("params", "curvatures", "curvature_grads"):
+            torch.testing.assert_close(getattr(one_device, name), getattr(helped, name), rtol=1e-10, atol=1e-12)
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam"])
@@ -134,7 +156,7 @@ def test_lr_schedule(optimizer, float64):
     assert lrs[0] == lr / 2 and lrs[1] == lrs[2] == lr and lr > lrs[3] > lrs[4] > lrs[5] == pytest.approx(LRSchedule.FINAL_FRACTION * lr)
     assert type(state)(**asdict(state)).lr == state.lr  # survives a save
     final = magic.train(state, n_steps=n_steps)
-    outputs, betas = backprop(magic, state, n_steps, [test_loader.dataset.examples(torch.arange(10))])
+    outputs, d_weights = backprop(magic, state, n_steps, [test_loader.dataset.examples(torch.arange(10))])
 
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
@@ -144,8 +166,8 @@ def test_lr_schedule(optimizer, float64):
     for a, b in zip(final, s):
         torch.testing.assert_close(a, b.detach())
     X, Y = test_loader.dataset.examples(torch.arange(10))
-    f = cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean()
-    torch.testing.assert_close(betas[0], torch.autograd.grad(f, w)[0])
+    f = cross_entropy(functional_call(magic.objective.model, s.params, (X,)), Y).mean()
+    torch.testing.assert_close(d_weights[0], torch.autograd.grad(f, w)[0])
 
 
 def test_train_yields_grads_and_graph(float64):
@@ -158,10 +180,10 @@ def test_train_yields_grads_and_graph(float64):
             continue
         X, Y, _ = magic.loader.get_batch(t)
         assert all(p.requires_grad and p.is_leaf for p in s.params.values())
-        expected = torch.autograd.grad(cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean(), s.params)
+        expected = torch.autograd.grad(cross_entropy(functional_call(magic.objective.model, s.params, (X,)), Y).mean(), s.params)
         torch.testing.assert_close(grads, expected)
         V = {k: torch.randn(2, *p.shape) for k, p in s.params.items()}
-        torch.testing.assert_close(hvp_from_grads(grads, s.params)(V), magic.hvp_fn(s.params, X, Y)(V))
+        torch.testing.assert_close(hvp_from_grads(grads, s.params)(V), magic.objective.hvp_fn(s.params, X, Y)(V))
         v = {k: V_k[0] for k, V_k in V.items()}
         new = s._update(t, grads)
         jtv = torch.autograd.grad(list(new), list(s), list(v.values()), retain_graph=True)
@@ -214,21 +236,22 @@ def test_magic_does_not_modify_init_state():
 
 @pytest.mark.parametrize("passes", [1, 2])
 def test_backprop_in_segments(passes, float64):
-    """Backpropagating from checkpoint to checkpoint (each segment from the delta the next one returns) = in one go."""
+    """Backpropagating from checkpoint to checkpoint (each segment from the d_state the next one returns) = in one go."""
     magic, _, test_loader, state = setup("momentum")
     eval_sets = [test_loader.dataset.examples(idx) for idx in (torch.arange(10), torch.arange(20, 50))]
     bounds = [0, 3, 4, 9]
     states = {0: state}
     for a, b in zip(bounds, bounds[1:]):
         states[b] = magic.train(states[a], n_steps=b - a, start=a, pbar=False)
-    outputs, delta = magic.eval_grads(states[9], eval_sets)
-    whole_delta, whole = magic.backprop(state, delta, n_steps=9)
-    betas = torch.zeros_like(whole)
+    outputs, f_grads = magic.objective.eval_grads(states[9].params, eval_sets)
+    d_state = states[9].cotangent(f_grads)
+    whole_d_state, whole = magic.backprop(state, d_state, n_steps=9)
+    d_weights = torch.zeros_like(whole)
     for a, b in reversed(list(zip(bounds, bounds[1:]))):
-        delta, segment_betas = magic.backprop(states[a], delta, n_steps=b - a, start=a, passes=passes)
-        betas += segment_betas
-    torch.testing.assert_close(betas, whole)
-    for a, b in zip(delta, whole_delta):
+        d_state, segment_d_weights = magic.backprop(states[a], d_state, n_steps=b - a, start=a, passes=passes)
+        d_weights += segment_d_weights
+    torch.testing.assert_close(d_weights, whole)
+    for a, b in zip(d_state, whole_d_state):
         torch.testing.assert_close(a, b)
     torch.testing.assert_close(outputs, backprop(magic, state, 9, eval_sets)[0])
 
@@ -246,7 +269,7 @@ def test_top_hessian_eigs_match_dense(precond, negative, float64):
 
     def loss(flat: torch.Tensor) -> torch.Tensor:
         unflat = {k: v.view_as(p) for (k, p), v in zip(params.items(), flat.split(sizes))}
-        return cross_entropy(functional_call(magic.model, unflat, (X,)), Y).mean()
+        return cross_entropy(functional_call(magic.objective.model, unflat, (X,)), Y).mean()
 
     flat = torch.cat([p.detach().flatten() for p in params.values()])
     H = torch.func.hessian(loss)(flat)
@@ -257,7 +280,7 @@ def test_top_hessian_eigs_match_dense(precond, negative, float64):
     expected = all_eigs[:3] if negative else all_eigs.flip(0)[:3]
     assert (expected < 0).all() if negative else (expected > 0).all()  # the Hessian is indefinite: both signs tested
 
-    hvp_fn = magic.hvp_fn(params, X, Y)  # V -> H V on batched params dicts
+    hvp_fn = magic.objective.hvp_fn(params, X, Y)  # V -> H V on batched params dicts
     start = {k: torch.randn(3, *p.shape, generator=g, dtype=p.dtype) for k, p in params.items()}
     eigvals, eigvecs, n_iter = hessian_eigs(hvp_fn, start, P, sign=-1 if negative else 1)
     eigvals, _, _ = hessian_eigs(hvp_fn, eigvecs, P, sign=-1 if negative else 1)  # warm-started, like the logging
@@ -370,19 +393,20 @@ def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     model = model_cls(train_ds.in_shape, train_ds.out_dim, **kwargs)
     state = SGDState(params={k: p.detach().clone() for k, p in model.named_parameters()}, lr=LRSchedule(0.1))
     logger = Logger(name="test")
-    magic, test_loader = Magic(model=model, loader=Loader(train_ds, batch_size=4), loss_fn=cross_entropy), Loader(test_ds)
+    magic, test_loader = Magic(objective=Objective(model=model, loss_fn=cross_entropy), loader=Loader(train_ds, batch_size=4)), Loader(test_ds)
     train_logged(magic, state, n_steps=5, test_loader=test_loader, logger=logger, eval_every=2, n_top_eigs=2, eig_every=2, tangent=True)  # eigs at step 4
     eval_sets = [test_loader.dataset.examples(torch.arange(8))]
-    outputs, betas = backprop(magic, state, 3, eval_sets, log=logger)
-    delta = magic.eval_grads(magic.train(state, n_steps=3), eval_sets)[1]
-    for t, _, delta, d_weights in magic.backprop.trace(state, delta, n_steps=3):
-        assert d_weights.shape == (1, 4)
+    final = magic.train(state, n_steps=3)
+    d_state = final.cotangent(magic.objective.eval_grads(final.params, eval_sets)[1])
+    _, d_weights = backprop_logged(magic, state, d_state, eval_sets, logger, n_steps=3)
+    for t, _, d_state, d_batch_weights in magic.backprop.trace(state, d_state, n_steps=3):
+        assert d_batch_weights.shape == (1, 4)
     logger.finish(tmp_path / "metrics.pt")
     metrics = torch.load(tmp_path / "metrics.pt", weights_only=True)
     assert all(torch.isfinite(m["value"]).all() for m in metrics.values())
     assert {"loss", "acc", "eig/1", "eig/2", "test_loss", "test_acc", "params/out.weight",
-            "grads/out.bias", "tangent/params/out.weight", "delta/0/params/out.weight", "d_weights/0"} <= set(metrics)
-    assert betas.shape == (1, len(train_ds)) and torch.isfinite(betas).all() and (betas != 0).any()
+            "grads/out.bias", "tangent/params/out.weight", "d_state/0/params/out.weight", "d_weights/0"} <= set(metrics)
+    assert d_weights.shape == (1, len(train_ds)) and torch.isfinite(d_weights).all() and (d_weights != 0).any()
     assert (tmp_path / "metrics.png").exists() and (tmp_path / "metrics_norms.png").exists()
 
 
@@ -399,82 +423,3 @@ def test_mu_linear_init():
     torch.testing.assert_close((readout.mult * readout.weight).var().item(), 1 / 256**2, rtol=0.2, atol=0)
 
 
-@pytest.mark.parametrize("loss", ["ce", "mse"])
-def test_gauss_newton_matches_explicit(float64, loss):
-    """`Magic.gnvp_fn` is J^T H_L J / B (explicit Jacobians of a tiny MLP), batched over the vectors; for the MSE it has the Hessian's
-    form J^T J / B, and equals the Hessian for a linear model."""
-    from src.utils import LOSSES, OUTPUT_HESSIANS
-    from src.lobpcg import flatten, unflatten
-    train_ds = Majority(True, size=64, dim=8)
-    torch.manual_seed(0)
-    model = MLP((8,), 2, width=16, depth=1)
-    params = {k: p.detach().clone() for k, p in model.named_parameters()}
-    magic = Magic(model=model, loader=Loader(train_ds, batch_size=16), loss_fn=LOSSES[loss])
-    X, Y, _ = magic.loader.get_batch(0)
-    V = {k: torch.randn(3, *p.shape) for k, p in params.items()}
-    GV = flatten(magic.gnvp_fn(params, X, Y)(V))  # [N, 3]
-    # explicit: J [B, C, N] (the params in `flatten`'s order), H_L [B, C, C] as a matrix per example
-    out = functional_call(model, params, (X,))
-    B, C = out.shape
-    jac = torch.func.jacrev(lambda p: functional_call(model, p, (X,)))(params)  # name -> [B, C, *shape]
-    J = torch.cat([jac[k].reshape(B, C, -1) for k in params], -1)
-    H_L = torch.stack([OUTPUT_HESSIANS[LOSSES[loss]](out, Y, torch.eye(C)[c].expand(B, C)) for c in range(C)], -1)  # [:, :, c] = H_L e_c
-    G = torch.einsum("bcn,bcd,bdm->nm", J, H_L, J) / B
-    torch.testing.assert_close(GV, G @ flatten(V))
-    single = magic.gnvp_fn(params, X, Y)({k: v[0] for k, v in V.items()})
-    torch.testing.assert_close(flatten(single, batched=False), GV[:, 0])
-    traced = torch.compile(magic.gnvp_fn(params, X, Y), backend="eager", fullgraph=True)  # dynamo traces it as one graph (no C++ compiler here)
-    torch.testing.assert_close(flatten(traced(V)), GV)
-    if loss == "mse":  # linear model: Gauss-Newton = Hessian
-        lin = Linear(8, 2)
-        p_lin = {k: p.detach().clone() for k, p in lin.named_parameters()}
-        m2 = Magic(model=lin, loader=magic.loader, loss_fn=LOSSES[loss])
-        v = {k: torch.randn_like(p) for k, p in p_lin.items()}
-        torch.testing.assert_close(m2.gnvp_fn(p_lin, X, Y)(v), dict(m2.hvp_fn(p_lin, X, Y)(v)))
-
-
-def test_gauss_newton_backprop_matches_exact_for_linear_model(float64):
-    """The GN backward (SGD only) against the exact one: for a linear model with the MSE, the Gauss-Newton matrix is the
-    Hessian so `gn=True` must match `gn=False`. And against the closed form (I - lr (GN + wd I)) delta for an arbitrary GN product."""
-    from src.utils import mse
-    train_ds, test_ds = Majority(True, size=64, dim=8), Majority(False, size=64, dim=8)
-    torch.manual_seed(0)
-    model = Linear(8, 2)
-    params = {k: p.detach().clone() for k, p in model.named_parameters()}
-    state = SGDState(params=params, lr=LRSchedule(0.1), wd=0.01)
-    magic = Magic(model=model, loader=Loader(train_ds, batch_size=8, seed=3), loss_fn=mse)
-    eval_sets = [test_ds.examples(torch.arange(10)), test_ds.examples(torch.arange(20, 50))]
-    outputs, betas = backprop(magic, state, 7, eval_sets)
-    outputs_gn, betas_gn = backprop(magic, state, 7, eval_sets, gn=True)
-    final_delta = magic.eval_grads(magic.train(state, n_steps=7), eval_sets)[1]
-    torch.testing.assert_close(outputs_gn, outputs)
-    torch.testing.assert_close(betas_gn, betas)
-    # perturbed steps 3-6 only: the steps t >= 3 are backpropagated as before, the steps t < 3 contribute nothing (df/ds_0 = 0)
-    batches = [set(magic.loader.get_batch(t)[2].tolist()) for t in range(7)]
-    kept = torch.tensor([not any(i in b for b in batches[:3]) for i in range(len(train_ds))])
-    trace = magic.backprop.trace(state, final_delta, n_steps=7, gn=True, perturbed=range(3, 7))
-    steps = []
-    try:
-        while True:
-            steps.append(next(trace)[0])
-    except StopIteration as e:
-        _, betas_late = e.value
-    assert steps == [6, 5, 4, 3]
-    torch.testing.assert_close(betas_late[:, kept], betas[:, kept])
-    assert (betas_late[:, ~kept] == 0).all()
-    # perturbed steps 0-1 only: df/ds_t goes through all the steps, df/dw_t is added for t < 2 alone
-    _, betas_early = backprop(magic, state, 7, eval_sets, perturbed=range(0, 2))
-    early = torch.tensor([any(i in b for b in batches[:2]) for i in range(len(train_ds))])
-    only_early = early & torch.tensor([not any(i in b for b in batches[2:]) for i in range(len(train_ds))])
-    torch.testing.assert_close(betas_early[:, only_early], betas[:, only_early])
-    assert (betas_early[:, ~early] == 0).all() and only_early.any()
-
-    delta = state.apply(lambda t: torch.randn(2, *t.shape))
-    gnvp = lambda V, create_graph=False: {k: 3.0 * v for k, v in V.items()}  # any symmetric matrix
-    new_delta, d_grads = state.gn_vjp(0, delta, gnvp)
-    for k, d in delta.params.items():
-        torch.testing.assert_close(new_delta.params[k], d - state.lr(0) * (3.0 * d + state.wd * d))
-        torch.testing.assert_close(d_grads[k], -state.lr(0) * d)
-    with pytest.raises(AssertionError, match="only implemented for SGD"):
-        momentum = SGDMomentumState(params=params, lr=LRSchedule(0.1))
-        backprop(magic, momentum, 2, eval_sets, gn=True)

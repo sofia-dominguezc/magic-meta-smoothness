@@ -40,7 +40,7 @@ def bench_hvp(exp: Experiment, runs: int, reps: int) -> dict[str, tuple[float, f
     magic = exp.magic
     X, Y, _ = exp.loader.get_batch(0)
     params = {k: p.to(exp.device).requires_grad_() for k, p in exp.init_state.params.items()}
-    grads = torch.autograd.grad(magic.forward(params, X, Y)[0], params, create_graph=True)
+    grads = torch.autograd.grad(magic.objective.forward(params, X, Y)[0], params, create_graph=True)
     vectors = {k: torch.randn(runs, *p.shape, device=p.device) for k, p in params.items()}
 
     def hvp(cotangents: list[Tensor], batched: bool):

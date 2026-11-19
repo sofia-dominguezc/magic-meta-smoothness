@@ -1,14 +1,10 @@
-"""The model call, losses and metrics, and Hessian-vector products from gradients."""
+"""Helpers on params dicts {name: tensor}: Hessian-vector products, `dict_zip`, `flatten` / `unflatten`."""
 
 from typing import Callable, Mapping, Protocol
 
 import torch
-from torch import Tensor, nn
-import torch.nn.functional as F
-from torch.func import functional_call, grad, jvp, vmap
-
-
-LossFn = Callable[[Tensor, Tensor], Tensor]  # (model output [B, C], int labels [B]) -> per-example losses [B]
+from torch import Tensor
+from torch.func import grad, jvp, vmap
 
 
 class HVP(Protocol):
@@ -58,43 +54,14 @@ def dict_zip[T](*dicts: Mapping[str, T]) -> dict[str, tuple[T, ...]]:
     return {key: tuple(d[key] for d in dicts) for key in dicts[0]}
 
 
-def cross_entropy(out: Tensor, Y: Tensor) -> Tensor:
-    return F.cross_entropy(out, Y, reduction="none")
+def flatten(d: dict[str, Tensor], batched: bool = True) -> Tensor:
+    """{name: [m, *shape]} -> [#params, m] (the batch as columns); not batched: {name: [*shape]} -> [#params]"""
+    return torch.cat([v.flatten(1) for v in d.values()], dim=1).T if batched else torch.cat([v.flatten() for v in d.values()])
 
 
-def mse(out: Tensor, Y: Tensor) -> Tensor:
-    """Squared error to the one-hot labels (built by comparison, as `F.one_hot` doesn't support vmap)"""
-    one_hot = (Y[:, None] == torch.arange(out.shape[1], device=out.device)).to(out.dtype)
-    return 0.5 * (out - one_hot).pow(2).sum(-1)
-
-
-LOSSES: dict[str, LossFn] = {"ce": cross_entropy, "mse": mse}
-
-
-def cross_entropy_output_hessian(out: Tensor, Y: Tensor, U: Tensor) -> Tensor:
-    """H_L U per example for the cross-entropy: (diag(p) - p p^T) u with p = softmax(out)"""
-    p = out.softmax(-1)
-    return p * (U - (p * U).sum(-1, keepdim=True))
-
-
-def mse_output_hessian(out: Tensor, Y: Tensor, U: Tensor) -> Tensor:
-    return U
-
-
-OUTPUT_HESSIANS: dict[LossFn, Callable[[Tensor, Tensor, Tensor], Tensor]] = {  # loss -> (out [B, C], Y [B], U [B, C]) -> H_L U [B, C]
-    cross_entropy: cross_entropy_output_hessian, mse: mse_output_hessian,
-}
-
-
-def metrics(out: Tensor, Y: Tensor) -> dict[str, Tensor]:
-    """Per-example classification metrics of the model: accuracy and margin."""
-    correct = out.gather(1, Y[:, None])[:, 0]
-    best_other = out.scatter(1, Y[:, None], float("-inf")).max(1).values
-    return {"acc": (out.argmax(1) == Y).to(out.dtype), "margin": correct - best_other}
-
-
-def model_call(model: nn.Module, params: dict[str, Tensor], X: Tensor, *, bf16: bool = False) -> Tensor:
-    """`model(params, X)`, with the matmuls in bfloat16 (autocast) if `bf16`"""
-    with torch.autocast(X.device.type, torch.bfloat16, enabled=bf16):
-        out: Tensor = functional_call(model, params, (X,))
-    return out.to(X.dtype)
+def unflatten(V: Tensor, shapes: Mapping[str, torch.Size]) -> dict[str, Tensor]:
+    """Inverse of `flatten`: [#params, m] -> {name: [m, *shapes[name]]}, [#params] -> {name: [*shapes[name]]}"""
+    return {
+        name: v.T.reshape(-1, *shape) if V.ndim == 2 else v.reshape(shape)
+        for v, (name, shape) in zip(V.split([shape.numel() for shape in shapes.values()]), shapes.items())
+    }

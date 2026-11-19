@@ -21,10 +21,11 @@ from torch import Tensor
 
 from experiments.arch_search import EMA_GAMMA, append_jsonl, build_model, read_jsonl, sync
 from src.data import DATASETS, Loader
+from src.objective import LOSSES, Objective, metrics
 from src.logging import fig_title
 from src.magic import Magic
 from src.optimizers import AdamState, LRSchedule, SGDState
-from src.utils import LOSSES, dict_zip, metrics
+from src.utils import dict_zip
 
 MODELS = {"cnn": (32, 2), "vit": (128, 4)}  # model -> (width, depth); the lr is tuned at half the width
 BATCH_SIZES = [16, 32, 64, 128]
@@ -40,7 +41,7 @@ def lr_grid(model: str, optimizer: str, batch_size: int) -> list[float]:
 
 def evaluate(magic: Magic, params: dict[str, Tensor], loader: Loader, indices: Tensor, batched: bool) -> tuple[Tensor, Tensor]:
     """Mean (loss, acc) of `params` on the examples `indices`; one per model [R] if `batched`"""
-    forward = torch.func.vmap(magic.forward, in_dims=(0, None, None)) if batched else magic.forward
+    forward = torch.func.vmap(magic.objective.forward, in_dims=(0, None, None)) if batched else magic.objective.forward
     loss, acc = 0.0, 0.0
     with torch.no_grad():
         for X, Y in loader.iter_batches(indices):
@@ -55,7 +56,7 @@ def train_models(
 ) -> list[dict]:
     """Train one model per lr (vmapped if several) and evaluate each and its power-function EMA on the test set"""
     batched = len(lrs) > 1
-    magic = Magic(model=model, loader=Loader(train_ds, batch_size, device=device), loss_fn=LOSSES["ce"], compile=device.startswith("cuda"))
+    magic = Magic(objective=Objective(model=model, loss_fn=LOSSES["ce"]), loader=Loader(train_ds, batch_size, device=device), compile=device.startswith("cuda"))
     params = {k: p.detach().clone() for k, p in model.named_parameters()}
     weights = None
     if not batched:

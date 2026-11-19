@@ -1,13 +1,13 @@
 """
 Redraw <dir>/metrics.png (scalars) and <dir>/metrics_norms[_<group>].png (norms) from the saved <dir>/metrics.pt of DIR/full_model,
-DIR/magic* (every magic dir) and DIR/rayleigh, without retraining (e.g. after a change of Logger._plot_scalars / _plot_norms, or
+DIR/magic and DIR/rayleigh, without retraining (e.g. after a change of Logger._plot_scalars / _plot_norms, or
 to switch the scales):
   python -m experiments.replot all DIR [DIR ...] [--yscale log|linear]
   python -m experiments.replot zoom DIR --start S --n-steps N   # only the steps S to S + N (of the config: edge flow substeps
-      are scaled) of DIR/full_model and DIR/magic*, into <dir>/metrics_zoom_<S>_<S+N>[_norms...].png next to the full plots
---yscale: of all the norm panels (full_model: params, grads, tangent, eigvec; magic: delta) and of the norm-like scalar panels
+      are scaled) of DIR/full_model and DIR/magic, into <dir>/metrics_zoom_<S>_<S+N>[_norms...].png next to the full plots
+--yscale: of all the norm panels (full_model: params, grads, tangent, eigvec; magic: d_state) and of the norm-like scalar panels
 (d_weights, displacements, total norms) and the eigenvalues "eig" (default: the Logger's, log for the norms and linear for "eig").
---log-derivative: also <dir>/metrics_norms_dlog.png, for the "tangent/..." (full_model) and "delta" (magic, rayleigh) panels: the
+--log-derivative: also <dir>/metrics_norms_dlog.png, for the "tangent/..." (full_model) and "d_state" (magic, rayleigh) panels: the
 growth per step of y_n = max op norm over the panel's tensors (y_{n+1} / y_n for the tangent, y_n / y_{n+1} for df/ds_t;
 linear scale) with |1 - P eig| for the eigenvalues "eig/i" logged by `train` (P = stability threshold / its logged "eig/threshold").
 """
@@ -20,11 +20,11 @@ from typing import Any
 import click
 import torch
 
-from main import Experiment
+from main import Experiment, load_renamed
 from src.logging import Logger
 
 
-NORM_LIKE = ("delta", "tangent", "params", "grads", "eigvec", "displacement")  # scalar panels of total norms (`Logger(total_norms=True)`)
+NORM_LIKE = ("d_state", "tangent", "params", "grads", "eigvec", "displacement")  # scalar panels of total norms (`Logger(total_norms=True)`)
 
 
 def slice_steps(metrics: dict, steps: tuple[int, int]) -> dict:
@@ -44,7 +44,7 @@ def replot(metrics_path: Path, name: str, yscale: str | None = None, eos: float 
     {"eig/i": {"step", "value"}} drawn as |1 - P eig| in the derivative plot, with P = eos / "eig/threshold" (default: those of
     `metrics_path`; without "eig/threshold", |1 - eig|). `split_norms`, `step_scale`: see `Logger`. `steps`: only the logged
     steps (unscaled) in this range, into <stem>_zoom_<start>_<end>*.png (the config's steps) instead of <stem>*.png"""
-    metrics = torch.load(metrics_path, weights_only=True)
+    metrics = load_renamed(metrics_path)
     all_eigs = metrics if eigs is None else eigs
     if steps is not None:
         metrics, all_eigs = slice_steps(metrics, steps), slice_steps(all_eigs, steps)
@@ -65,7 +65,7 @@ def replot(metrics_path: Path, name: str, yscale: str | None = None, eos: float 
         logger._plot_scalars(metrics, scalars, metrics_path.with_suffix(".png"))
     if norms:
         logger._plot_norms(metrics, norms, metrics_path.with_name(f"{metrics_path.stem}_norms.png"), split=split_norms)
-    derivs = {p: names for p, names in norms.items() if p.startswith(("tangent", "delta"))}  # directions propagated by the training
+    derivs = {p: names for p, names in norms.items() if p.startswith(("tangent", "d_state"))}  # directions propagated by the training
     if derivs and log_derivative:
         fig, axes = logger._grid(len(derivs), ncols=2, size=(10, 6))
         for ax, (panel, names) in zip(axes, derivs.items()):
@@ -73,7 +73,7 @@ def replot(metrics_path: Path, name: str, yscale: str | None = None, eos: float 
             assert all(torch.equal(metrics[k]["step"], steps) for k in names)
             order = steps.argsort()  # MAGIC logs the steps in reverse
             steps, y = steps[order], torch.stack([metrics[k]["value"][order] for k in names]).max(0).values  # max op norm over the tensors
-            backward = panel.startswith("delta")  # df/ds_t is propagated backward: its growth per step is y_n / y_(n+1)
+            backward = panel.startswith("d_state")  # df/ds_t is propagated backward: its growth per step is y_n / y_(n+1)
             ratio, label = (y[:-1] / y[1:], "y_n / y_(n+1)") if backward else (y[1:] / y[:-1], "y_(n+1) / y_n")
             ax.plot(steps[:-1].numpy(), ratio.numpy(), lw=1, color="C0", label=f"{label}, y = max op norm")
             for i, k in enumerate(sorted(eigs, key=lambda k: int(k.split("/")[1]), reverse=True)):
@@ -98,10 +98,8 @@ def replot_experiment(exp_dir: Path, yscale: str | None, log_derivative: bool, r
     eigs = torch.load(exp_dir / "full_model" / "metrics.pt", weights_only=True) if (exp_dir / "full_model" / "metrics.pt").exists() else {}
     common = dict(yscale=yscale, log_derivative=log_derivative, step_scale=exp.substeps, steps=None if steps is None else (steps[0] * exp.substeps, steps[1] * exp.substeps))
     plots: list[tuple[str, str, dict[str, Any]]] = [
-        ("full_model", exp.name, dict(eos=eos)),
-        *((d.name, f"MAGIC{'' if d.name == 'magic' else f' ({d.name.removeprefix('magic_')})'}: df/ds_t and df/dw_t; {exp.name}",
-           dict(eigs=eigs, smooth=False, split_norms=True))
-          for d in sorted(exp_dir.glob("magic*")) if not d.name.startswith("magic_eigs")),
+        ("full_model", exp.name, dict(eos=eos, smooth=exp.cfg.optimizer != "centralflow")),
+        *([("magic", f"MAGIC: df/ds_t and df/dw_t; {exp.name}", dict(eigs=eigs, smooth=False, split_norms=True))] if (exp_dir / "magic").exists() else []),
     ]
     if rayleigh:
         plots.append(("rayleigh", f"rayleigh: final Hessian eigenvectors along training, MAGIC's df/ds_t; {exp.name}", dict(eigs=eigs, smooth=False)))

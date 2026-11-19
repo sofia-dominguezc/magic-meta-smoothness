@@ -1,13 +1,13 @@
 """LOBPCG (`torch_lobpcg`, copied and translated into PyTorch from Google's JAX implementation:
-https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L105), the Hessian eigenvalues it computes
-(`hessian_eigs`) and the dict <-> flat translation (`flatten` / `unflatten`) of the flat-vector black boxes (it and `minres`)."""
+https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L105), and the Hessian eigenvalues it computes
+(`hessian_eigs`)."""
 
 from typing import Callable, Mapping
 
 import torch
 from torch import Tensor
 
-from src.utils import HVP
+from src.utils import HVP, flatten, unflatten
 
 
 def torch_lobpcg(
@@ -132,19 +132,6 @@ def _extend_basis(X, m):
     h = -2 * torch.linalg.multi_dot([w, w[k:, :].T, other])
     h[k:] += other
     return h
-
-
-def flatten(d: dict[str, Tensor], batched: bool = True) -> Tensor:
-    """{name: [m, *shape]} -> [#params, m] (the batch as columns); not batched: {name: [*shape]} -> [#params]"""
-    return torch.cat([v.flatten(1) for v in d.values()], dim=1).T if batched else torch.cat([v.flatten() for v in d.values()])
-
-
-def unflatten(V: Tensor, shapes: Mapping[str, torch.Size]) -> dict[str, Tensor]:
-    """Inverse of `flatten`: [#params, m] -> {name: [m, *shapes[name]]}, [#params] -> {name: [*shapes[name]]}"""
-    return {
-        name: v.T.reshape(-1, *shape) if V.ndim == 2 else v.reshape(shape)
-        for v, (name, shape) in zip(V.split([shape.numel() for shape in shapes.values()]), shapes.items())
-    }
 
 
 def hessian_eigs(

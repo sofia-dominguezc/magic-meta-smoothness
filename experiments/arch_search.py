@@ -23,11 +23,12 @@ import numpy as np
 import torch
 
 from src.data import DATASETS, Loader
+from src.objective import LOSSES, Objective
 from src.logging import fig_title
 from src.magic import Magic
 from src.models import MODELS
 from src.optimizers import AdamState, LRSchedule, OptimState, SGDState
-from src.utils import LOSSES, dict_zip
+from src.utils import dict_zip
 
 # (model, width, depth): 0.3M to 5M params (depth: blocks per stage of the cnn)
 ARCHS = [
@@ -122,12 +123,12 @@ def time_command(out_dir, device, compile_budget, archs, max_batch, compiled_vma
             continue
         model = build_model(model_name, width, depth, train_ds.in_shape, train_ds.out_dim, device)
         n_params = sum(p.numel() for p in model.parameters())
-        magic = Magic(model=model, loader=Loader(train_ds, VMAP_BATCH, device=device), loss_fn=LOSSES["ce"])
-        vmapped = torch.func.vmap(magic.forward, in_dims=(0, None, None, None))
+        magic = Magic(objective=Objective(model=model, loss_fn=LOSSES["ce"]), loader=Loader(train_ds, VMAP_BATCH, device=device))
+        vmapped = torch.func.vmap(magic.objective.forward, in_dims=(0, None, None, None))
         vmapped_forward = lambda params, X, Y, weights=None: vmapped(params, X, Y, weights)
-        forwards = {("eager", False): magic.forward, ("eager", True): vmapped_forward}
+        forwards = {("eager", False): magic.objective.forward, ("eager", True): vmapped_forward}
         if compile_seconds < 60 * compile_budget:
-            forwards |= {("compiled", False): torch.compile(magic.forward), ("compiled", True): torch.compile(vmapped_forward)}
+            forwards |= {("compiled", False): torch.compile(magic.objective.forward), ("compiled", True): torch.compile(vmapped_forward)}
         # (optimizer, mode, batch size, vmapped models): adam's compiled forward is sgd's
         jobs = [(opt, mode, B, 1) for opt, mode in (("sgd", "eager"), ("sgd", "compiled"), ("adam", "eager")) for B in BATCH_SIZES if B <= max_batch]
         jobs += [("sgd", mode, VMAP_BATCH, R) for mode in ("eager", "compiled")[: 2 if compiled_vmap else 1] for R in N_MODELS[1:] if VMAP_BATCH * R <= max_batch]
@@ -170,12 +171,12 @@ def train_run(magic: Magic, state: OptimState, test_loader: Loader, n_steps: int
         if t % 50 == 0 and not all(torch.isfinite(p).all() for p in params.values()):
             break
         if t and t % (n_steps // 4) == 0 and grads is not None:
-            curve[t] = round(magic.eval_loss(ema, test_loader, some_test)[1]["acc"].item(), 4)
+            curve[t] = round(magic.objective.eval_loss(ema, test_loader, some_test)[1]["acc"].item(), 4)
     sync(device)
     seconds = time.perf_counter() - start
     row = {"train_s": round(seconds, 2), "ema_test_acc_curve": curve}
     for name, p in (("test", params), ("ema_test", ema)):
-        loss, mean_metrics = magic.eval_loss(p, test_loader, all_test)
+        loss, mean_metrics = magic.objective.eval_loss(p, test_loader, all_test)
         finite = bool(torch.isfinite(loss))
         row |= {f"{name}_loss": round(loss.item(), 4) if finite else None, f"{name}_acc": round(mean_metrics["acc"].item(), 4) if finite else None}
     return row
@@ -205,7 +206,7 @@ def train(out_dir, device, steps, batch_size, budget, archs, models, sgd_lrs, ad
             if (archs is not None and arch not in archs.split(",")) or model_name not in models.split(","):
                 continue
             model = build_model(model_name, width, depth, train_ds.in_shape, train_ds.out_dim, device)
-            magic = Magic(model=model, loader=loader, loss_fn=LOSSES["ce"])
+            magic = Magic(objective=Objective(model=model, loss_fn=LOSSES["ce"]), loader=loader)
             for opt in ("sgd", "adam"):
                 if lr_index >= len(lrs[opt]):
                     continue

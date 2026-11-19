@@ -77,8 +77,8 @@ def edgeflow_vs_gd(exp_dir: Path, device: str = "cpu", eig_every: int = 10, eval
             X, Y, _ = gd_magic.loader.get_batch(min(t, start + n_steps - 1))
             w, c = flat(s_gd.params), flat(s_ef.params)
             d_wc = w - c
-            logger.log(t, **{f"loss_{other}/{other}": exp.magic.forward(s_ef.params, X, Y)[0]})
-            logger.log(t, **{"loss_gd/gd": gd_magic.forward(s_gd.params, X, Y)[0]})
+            logger.log(t, **{f"loss_{other}/{other}": exp.objective.forward(s_ef.params, X, Y)[0]})
+            logger.log(t, **{"loss_gd/gd": gd_magic.objective.forward(s_gd.params, X, Y)[0]})
             logger.log(t, **{f"distance/gd-{other}": d_wc.norm()})
             logger.log(t, **{"travel/gd": (w - w0).norm(), f"travel/{other}": (c - w0).norm()})
             logger.log(t, **{"eig/threshold": torch.tensor(2 / s_gd.lr(t))})
@@ -86,7 +86,7 @@ def edgeflow_vs_gd(exp_dir: Path, device: str = "cpu", eig_every: int = 10, eval
                 u = flat(s_ef.eigvec)
                 amplitude = s_ef.eps["eps"]
                 proj_wc = d_wc @ u
-                symmetrized = sum(exp.magic.forward({k: p + sign * amplitude * v for k, (p, v) in dict_zip(s_ef.params, s_ef.eigvec).items()}, X, Y)[0]
+                symmetrized = sum(exp.objective.forward({k: p + sign * amplitude * v for k, (p, v) in dict_zip(s_ef.params, s_ef.eigvec).items()}, X, Y)[0]
                                   for sign in (1, -1)) / 2
                 logger.log(t, **{"loss_gd/symmetrized": symmetrized})
                 logger.log(t, **{"amplitude_along_u/edgeflow": amplitude})
@@ -99,9 +99,9 @@ def edgeflow_vs_gd(exp_dir: Path, device: str = "cpu", eig_every: int = 10, eval
                     logger.log(t, **{"cos_with_u/gd_gradient": (g @ u).abs() / g.norm()})
             if eval_every and ((t - start) % eval_every == 0 or g_gd is None):
                 for name, params in (("gd", s_gd.params), (other, s_ef.params)):
-                    logger.log(t, **{f"test_loss/{name}": exp.magic.eval_loss(params, exp.test_loader, test_idx)[0]})
+                    logger.log(t, **{f"test_loss/{name}": exp.objective.eval_loss(params, exp.test_loader, test_idx)[0]})
         if g_gd is not None and (t - start) % eig_every == 0:
-            hvp_fn = gd_magic.hvp_fn(s_gd.params, X, Y)
+            hvp_fn = gd_magic.objective.hvp_fn(s_gd.params, X, Y)
             if eigvec is None:
                 eigvec = {k: v.detach().clone() for k, v in s_ef.eigvec.items()} if is_edgeflow else random_like(s_gd.params)
             eigval, eigvec, _ = hessian_eigs(hvp_fn, eigvec, batched=False)
@@ -111,7 +111,7 @@ def edgeflow_vs_gd(exp_dir: Path, device: str = "cpu", eig_every: int = 10, eval
                 logger.log(t, **{"cos_with_u/gd_top_eigvec": (v @ flat(s_ef.eigvec)).abs()})
             else:
                 other_eigvec = random_like(s_ef.params) if other_eigvec is None else other_eigvec
-                other_eigval, other_eigvec, _ = hessian_eigs(exp.magic.hvp_fn(s_ef.params, X, Y), other_eigvec, batched=False)
+                other_eigval, other_eigvec, _ = hessian_eigs(exp.objective.hvp_fn(s_ef.params, X, Y), other_eigvec, batched=False)
                 logger.log(t, **{"eig/heun": other_eigval})
                 g = flat(g_gd)
                 logger.log(t, **{"cos_with_gd_eigvec/gd_gradient": (g @ v).abs() / g.norm()})

@@ -4,9 +4,10 @@ import pytest
 import torch
 from torch.func import functional_call
 
-from src.lobpcg import flatten, hessian_eigs, unflatten
+from src.lobpcg import hessian_eigs
+from src.objective import cross_entropy
 from src.minres import minres
-from src.utils import cross_entropy, dict_zip, hvp_from_grads
+from src.utils import dict_zip, flatten, hvp_from_grads, unflatten
 from test.test_magic import setup
 
 
@@ -58,7 +59,7 @@ def test_minres_damped_hessian(float64):
 
     def loss(flat: torch.Tensor) -> torch.Tensor:
         unflat = {k: v.view_as(p) for (k, p), v in zip(params.items(), flat.split(sizes))}
-        return cross_entropy(functional_call(magic.model, unflat, (X,)), Y).mean()
+        return cross_entropy(functional_call(magic.objective.model, unflat, (X,)), Y).mean()
 
     flat = torch.cat([p.detach().flatten() for p in params.values()])
     H = torch.func.hessian(loss)(flat)
@@ -68,7 +69,7 @@ def test_minres_damped_hessian(float64):
     shift = -(neg[i] + neg[i + 1]) / 2  # the middle of the largest gap between negative eigenvalues: indefinite, nonsingular
     assert (eigs + shift).abs().min() > 1e-2 * eigs[-1]
 
-    hvp_fn = magic.hvp_fn(params, X, Y)  # V {name: [m, *shape]} -> H V
+    hvp_fn = magic.objective.hvp_fn(params, X, Y)  # V {name: [m, *shape]} -> H V
 
     def A(V: torch.Tensor) -> torch.Tensor:  # [#params, m] -> [#params, m]
         unflat = {k: v.T.reshape(-1, *p.shape) for (k, p), v in zip(params.items(), V.split(sizes))}
@@ -107,12 +108,12 @@ def test_newton_state(float64):
     sizes = [p.numel() for p in state.params.values()]
     s = state.apply(lambda t: t.clone().requires_grad_())
     w = torch.ones(len(train_ds), requires_grad=True)
-    loss = (w[idx] * cross_entropy(functional_call(magic.model, s.params, (X,)), Y)).mean()
+    loss = (w[idx] * cross_entropy(functional_call(magic.objective.model, s.params, (X,)), Y)).mean()
     grads = torch.autograd.grad(loss, s.params, create_graph=True)
 
     def flat_loss(flat: torch.Tensor) -> torch.Tensor:
         unflat = {k: v.view_as(p) for (k, p), v in zip(s.params.items(), flat.split(sizes))}
-        return cross_entropy(functional_call(magic.model, unflat, (X,)), Y).mean()
+        return cross_entropy(functional_call(magic.objective.model, unflat, (X,)), Y).mean()
 
     H = torch.func.hessian(flat_loss)(torch.cat([p.detach().flatten() for p in s.params.values()]))
     rhs = torch.cat([(g + 0.01 * p).detach().flatten() for p, g in dict_zip(s.params, grads).values()])
@@ -128,26 +129,28 @@ def test_newton_state(float64):
     assert not s.newton["out.weight"].requires_grad and s.params["out.weight"].requires_grad  # `apply` keeps the aux detached
 
     g = torch.Generator().manual_seed(0)
-    delta = new.apply(lambda t: torch.randn(2, *t.shape, generator=g))  # 2 cotangents on the new state (aux ignored)
-    expected = torch.autograd.grad(list(newton_step_unrolled(s, 0, grads)), [*s, w], list(delta), is_grads_batched=True, retain_graph=True)
-    forward_fn = lambda p: ((w[idx] * cross_entropy(functional_call(magic.model, p, (X,)), Y)).mean(), None)
-    cotangents = s.vjp(0, forward_fn, [*s, w], delta)
+    d_state = new.apply(lambda t: torch.randn(2, *t.shape, generator=g))  # 2 cotangents on the new state (aux ignored)
+    expected = torch.autograd.grad(list(newton_step_unrolled(s, 0, grads)), [*s, w], list(d_state), is_grads_batched=True, retain_graph=True)
+    forward_fn = lambda p: ((w[idx] * cross_entropy(functional_call(magic.objective.model, p, (X,)), Y)).mean(), None)
+    cotangents = s.vjp(0, forward_fn, [*s, w], d_state)
     assert len(cotangents) == len(expected) == len(sizes) + 1
     for a, b in zip(cotangents, expected):
         torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-8)
 
     n_steps, eval_sets = 3, [torch.arange(10), torch.arange(20, 50)]
-    outputs, delta = magic.eval_grads(magic.train(state, n_steps=n_steps), [test_loader.dataset.examples(idx) for idx in eval_sets])
-    betas = magic.backprop(state, delta, n_steps=n_steps)[1]
+    final = magic.train(state, n_steps=n_steps)
+    outputs, f_grads = magic.objective.eval_grads(final.params, [test_loader.dataset.examples(idx) for idx in eval_sets])
+    d_state = final.cotangent(f_grads)
+    d_weights = magic.backprop(state, d_state, n_steps=n_steps)[1]
     w = torch.ones(len(train_ds), requires_grad=True)
     s = state.apply(lambda t: t.clone().requires_grad_())
     for t in range(n_steps):
         X, Y, idx = magic.loader.get_batch(t)
-        loss = (w[idx] * cross_entropy(functional_call(magic.model, s.params, (X,)), Y)).mean()
+        loss = (w[idx] * cross_entropy(functional_call(magic.objective.model, s.params, (X,)), Y)).mean()
         s = newton_step_unrolled(s, t, torch.autograd.grad(loss, s.params, create_graph=True))
     for k, idx in enumerate(eval_sets):
         X, Y = test_loader.dataset.examples(idx)
-        f = cross_entropy(functional_call(magic.model, s.params, (X,)), Y).mean()
+        f = cross_entropy(functional_call(magic.objective.model, s.params, (X,)), Y).mean()
         (expected,) = torch.autograd.grad(f, w, retain_graph=True)
         torch.testing.assert_close(outputs[k], f.detach())
-        torch.testing.assert_close(betas[k], expected, rtol=1e-6, atol=1e-8)
+        torch.testing.assert_close(d_weights[k], expected, rtol=1e-6, atol=1e-8)

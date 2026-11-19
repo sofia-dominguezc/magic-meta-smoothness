@@ -36,7 +36,8 @@ from torch import Tensor
 from main import Experiment
 from src.magic import Magic
 from src.logging import fig_title
-from src.optimizers import OptimState, SecondOrderState
+from src.optimizers import OptimState
+from src.second_order import SecondOrderState
 from src.utils import dict_zip
 
 
@@ -79,7 +80,7 @@ def taylor_step(magic: Magic, t: int, state: OptimState, a: OptimState, b: Optim
 
     def step(tensors: list[Tensor]) -> tuple[Tensor, ...]:
         s = state.unflatten(tensors)
-        grads = torch.func.grad(lambda params: magic.forward(params, X, Y)[0])(s.params)
+        grads = torch.func.grad(lambda params: magic.objective.forward(params, X, Y)[0])(s.params)
         return tuple(s._update(t, grads))
 
     new, da, db = taylor(step, [x.detach() for x in state], list(a), list(b))
@@ -93,7 +94,7 @@ def run(exp: Experiment, out_dir: Path, n_models: int, eps: float, direction: st
     start_state = exp.start_state.apply(lambda t: t.to(exp.device))
     cpu_params = {k: p.cpu() for k, p in start_state.params.items()}
     X, Y = (x.to(exp.device) for x in exp.test_ds.examples(exp.test_ds.subset(n_test)))
-    example_loss = lambda p: magic.forward(p, X, Y)[0]
+    example_loss = lambda p: magic.objective.forward(p, X, Y)[0]
 
     runs: dict[str, list[Tensor]] = defaultdict(list)  # name -> per perturbation [steps]
     curv_steps, thresholds = [], []
@@ -120,7 +121,7 @@ def run(exp: Experiment, out_dir: Path, n_models: int, eps: float, direction: st
             if grads is None:
                 break
             if (t - start) % every == 0:
-                hvp_fn = magic.hvp_fn(center, *magic.loader.get_batch(t)[:2])
+                hvp_fn = magic.objective.hvp_fn(center, *magic.loader.get_batch(t)[:2])
                 for name, v in (("diff", D), ("tangent", T)):
                     Hv = hvp_fn(v)
                     out[f"{name}_Hv"].append((dot(Hv, Hv) / dot(v, v)).sqrt())
