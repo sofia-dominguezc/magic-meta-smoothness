@@ -24,8 +24,7 @@ from src.data import DATASETS, Loader
 from src.objective import LOSSES, Objective, metrics
 from src.logging import fig_title
 from src.magic import Magic
-from src.optimizers import AdamState, LRSchedule, SGDState
-from src.utils import dict_zip
+from src.optimizers import AdamState, dict_zip, LRSchedule, SGDState
 
 MODELS = {"cnn": (32, 2), "vit": (128, 4)}  # model -> (width, depth); the lr is tuned at half the width
 BATCH_SIZES = [16, 32, 64, 128]

@@ -27,8 +27,7 @@ from src.objective import LOSSES, Objective
 from src.logging import fig_title
 from src.magic import Magic
 from src.models import MODELS
-from src.optimizers import AdamState, LRSchedule, OptimState, SGDState
-from src.utils import dict_zip
+from src.optimizers import AdamState, dict_zip, LRSchedule, OptimState, SGDState
 
 # (model, width, depth): 0.3M to 5M params (depth: blocks per stage of the cnn)
 ARCHS = [
@@ -158,7 +157,7 @@ def time_command(out_dir, device, compile_budget, archs, max_batch, compiled_vma
 
 
 def train_run(magic: Magic, state: OptimState, test_loader: Loader, n_steps: int, device: str) -> dict:
-    """Train and evaluate the last params and their power-function EMA (as in `main.train_logged`) on the test set"""
+    """Train and evaluate the last params and their power-function EMA (as in `magic.TrainLog`) on the test set"""
     test_ds = test_loader.dataset
     all_test, some_test = torch.arange(len(test_ds)), test_ds.subset(min(2000, len(test_ds)))
     ema, params, curve = None, state.params, {}
@@ -171,12 +170,12 @@ def train_run(magic: Magic, state: OptimState, test_loader: Loader, n_steps: int
         if t % 50 == 0 and not all(torch.isfinite(p).all() for p in params.values()):
             break
         if t and t % (n_steps // 4) == 0 and grads is not None:
-            curve[t] = round(magic.objective.eval_loss(ema, test_loader, some_test)[1]["acc"].item(), 4)
+            curve[t] = round(magic.objective.eval_loss(ema, test_loader.iter_batches(some_test))[1]["acc"].item(), 4)
     sync(device)
     seconds = time.perf_counter() - start
     row = {"train_s": round(seconds, 2), "ema_test_acc_curve": curve}
     for name, p in (("test", params), ("ema_test", ema)):
-        loss, mean_metrics = magic.objective.eval_loss(p, test_loader, all_test)
+        loss, mean_metrics = magic.objective.eval_loss(p, test_loader.iter_batches(all_test))
         finite = bool(torch.isfinite(loss))
         row |= {f"{name}_loss": round(loss.item(), 4) if finite else None, f"{name}_acc": round(mean_metrics["acc"].item(), 4) if finite else None}
     return row

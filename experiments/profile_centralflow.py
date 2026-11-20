@@ -35,10 +35,10 @@ from torch import Tensor
 import src.second_order as second_order
 from main import Experiment
 from src.lobpcg import hessian_eigs
+from src.objective import hvp_from_forward, hvp_from_grads
 from src.magic import Magic
 from src.optimizers import LRSchedule
 from src.second_order import CentralFlowState, LossGraph
-from src.utils import hvp_from_forward, hvp_from_grads
 
 GB = 2**30
 

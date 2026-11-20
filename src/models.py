@@ -1,5 +1,5 @@
 """Models in the spectral form of μP (Yang, Simon & Bernstein 2023, "A spectral condition for feature learning"): layers
-store raw tensors with O(1) operator norm (`logging.op_norm`) behind fixed forward multipliers (`Linear`), so that one
+store raw tensors with O(1) operator norm behind fixed forward multipliers (`Linear`), so that one
 learning rate serves every raw tensor and transfers across widths (`optimizers.OptimState.precond`). Normalization layers are
 parameter-free: the training state is the parameters. Seed with torch.manual_seed before creating a model."""
 

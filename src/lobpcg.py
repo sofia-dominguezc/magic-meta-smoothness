@@ -1,13 +1,11 @@
 """LOBPCG (`torch_lobpcg`, copied and translated into PyTorch from Google's JAX implementation:
-https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L105), and the Hessian eigenvalues it computes
-(`hessian_eigs`)."""
+https://github.com/jax-ml/jax/blob/main/jax/experimental/sparse/linalg.py#L37-L105), the Hessian eigenvalues it computes
+(`hessian_eigs`) and the dict <-> flat translation (`flatten` / `unflatten`) for the flat-vector solvers (it and `minres`)."""
 
 from typing import Callable, Mapping
 
 import torch
 from torch import Tensor
-
-from src.utils import HVP, flatten, unflatten
 
 
 def torch_lobpcg(
@@ -134,26 +132,29 @@ def _extend_basis(X, m):
     return h
 
 
+def flatten(d: dict[str, Tensor], batched: bool = True) -> Tensor:
+    """{name: [m, *shape]} -> [#params, m] (the batch as columns); not batched: {name: [*shape]} -> [#params]"""
+    return torch.cat([v.flatten(1) for v in d.values()], dim=1).T if batched else torch.cat([v.flatten() for v in d.values()])
+
+
+def unflatten(V: Tensor, shapes: Mapping[str, torch.Size]) -> dict[str, Tensor]:
+    """Inverse of `flatten`: [#params, m] -> {name: [m, *shapes[name]]}, [#params] -> {name: [*shapes[name]]}"""
+    return {
+        name: v.T.reshape(-1, *shape) if V.ndim == 2 else v.reshape(shape)
+        for v, (name, shape) in zip(V.split([shape.numel() for shape in shapes.values()]), shapes.items())
+    }
+
+
 def hessian_eigs(
-    hvp_fn: HVP, eigvecs: dict[str, Tensor],
-    precond: Mapping[str, Tensor | float] | None = None, sign: float = 1, batched: bool = True, rtol: float = 0.03,
+    hvp_fn: Callable[[dict[str, Tensor]], dict[str, Tensor]], eigvecs: dict[str, Tensor],
+    sign: float = 1, batched: bool = True, rtol: float = 0.03,
 ) -> tuple[Tensor, dict[str, Tensor], int]:
-    """The top (sign -1: most negative) eigenvalues of sqrt(P) H sqrt(P) by `torch_lobpcg`.
+    """The top (sign -1: most negative) eigenvalues of H (`hvp_fn`: V {name: [m, *shape]} -> H V) by `torch_lobpcg`.
     eigvecs {name: [k, *shape]} -> (eigenvalues [k], eigenvectors like `eigvecs`, LOBPCG iterations)
     Not batched: a single start vector {name: [*shape]} -> (eigenvalue [], eigenvector like it, iterations)
     """
     shapes = {name: v.shape[1:] if batched else v.shape for name, v in eigvecs.items()}
-    sqrt_p = None if precond is None else flatten({
-        name: torch.as_tensor(precond[name], dtype=v.dtype, device=v.device).expand(shape)
-        for (name, shape), v in zip(shapes.items(), eigvecs.values())
-    }, batched=False).sqrt()[:, None]
-
-    def A(V: Tensor) -> Tensor:  # [#params, m] -> [#params, m] (LOBPCG uses m = k and 3k)
-        if sqrt_p is not None:
-            V = sqrt_p * V
-        HV = flatten(hvp_fn(unflatten(V, shapes)))
-        return sign * (HV if sqrt_p is None else sqrt_p * HV)
-
+    A = lambda V: sign * flatten(hvp_fn(unflatten(V, shapes)))  # [#params, m] -> [#params, m] (LOBPCG uses m = k and 3k)
     X = flatten(eigvecs, batched)
     eigvals, V, n_iter = torch_lobpcg(A, X if batched else X[:, None], rtol=rtol)
     return sign * (eigvals if batched else eigvals[0]), unflatten(V if batched else V[:, 0], shapes), n_iter

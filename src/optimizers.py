@@ -8,10 +8,14 @@ from typing import Callable, ClassVar, Iterator, Iterable, Mapping, Self, Sequen
 import torch
 from torch import Tensor
 
-from src.utils import dict_zip
-
 Forward = Callable[[dict[str, Tensor]], tuple[Tensor, Tensor]]  # params -> (batch loss [(R,)], outputs [(R,) B, C])
 StepOutput = tuple[dict[str, Tensor], Tensor, Tensor]  # (grads, loss, outputs)
+
+
+def dict_zip[T](*dicts: Mapping[str, T]) -> dict[str, tuple[T, ...]]:
+    """e.g. {"a": 1, "b": 2}, {"a": 3, "b": 4} -> {"a": (1, 3), "b": (2, 4)}"""
+    assert all(set(dicts[0]) == set(d) for d in dicts)
+    return {key: tuple(d[key] for d in dicts) for key in dicts[0]}
 
 
 @dataclass(frozen=True)

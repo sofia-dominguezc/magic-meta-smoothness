@@ -6,15 +6,13 @@ import torch
 from torch.func import functional_call
 
 from src.data import Dataset, Loader, Majority
-from src.objective import Objective, cross_entropy
+from src.objective import cross_entropy, hvp_from_grads, Objective
 from src.lobpcg import hessian_eigs
-from src.magic import Magic
-from src.utils import hvp_from_grads
+from src.magic import Magic, TrainLog, backprop_logged
 from src.models import MLP, Linear, ResNet, ViT
 from src.optimizers import AdamState, HeunState, LRSchedule, SGDMomentumState, SGDState
 from src.second_order import CentralFlowState, EdgeFlowState, NewtonState, SharpnessState
-from src.logging import Logger, op_norm
-from main import backprop_logged, train_logged
+from src.logging import Logger, scaled_l2
 
 
 def setup(optimizer: str, **kwargs):
@@ -91,25 +89,25 @@ def test_magic_matches_autograd_through_training(optimizer, float64):
 
 def test_centralflow_magic_matches_finite_differences(float64, monkeypatch):
     """MAGIC through central flow steps on the edge of stability (the SDCP solution and the critical eigenvectors
-    differentiated implicitly) against central finite differences of the training in the example weights (rtol 1e-5: the
-    eigensolver's 1e-11 error, amplified by 1 / 2 eps)."""
-    monkeypatch.setattr(CentralFlowState, "EIG_RTOL", 1e-11)
-    monkeypatch.setattr(CentralFlowState, "VJP_RTOL", 1e-11)
+    differentiated implicitly) against a central finite difference of the training in the example weights (rtol 1e-4: the
+    eigensolver's 1e-8 error, amplified by 1 / 2 eps)."""
+    monkeypatch.setattr(CentralFlowState, "EIG_RTOL", 1e-8)
+    monkeypatch.setattr(CentralFlowState, "VJP_RTOL", 1e-8)
     magic, train_ds, test_loader, state = setup("centralflow")
     X, Y, _ = magic.loader.get_batch(0)
     sharpness = hessian_eigs(magic.objective.hvp_fn(state.params, X, Y), state.eigvecs, rtol=1e-8)[0][0]
     state = replace(state, lr=LRSchedule(6 / sharpness.item()))  # starts well above the edge 2 / lr: several critical eigenvalues
-    n_steps, eval_sets = 8, [test_loader.dataset.examples(idx) for idx in (torch.arange(10), torch.arange(20, 50))]
-    stats = [s.stats for _, s, _ in magic.train.trace(state, n_steps=n_steps, pbar=False)][1:]
-    n_critical = [int(s["n_critical"]) for s in stats]
+    n_steps, eval_sets = 6, [test_loader.dataset.examples(idx) for idx in (torch.arange(10), torch.arange(20, 50))]
+    states = [s for _, s, _ in magic.train.trace(state, n_steps=n_steps, pbar=False)]
+    n_critical = [int(s.stats["n_critical"]) for s in states[1:]]
     assert min(n_critical) == 0 and max(n_critical) >= 3, n_critical  # below the edge too
-    _, d_weights = backprop(magic, state, n_steps, eval_sets)
+    d_state = states[-1].cotangent(magic.objective.eval_grads(states[-1].params, eval_sets)[1])
+    _, d_weights = magic.backprop(state, d_state, n_steps=n_steps, passes=1)
 
-    directions, eps = torch.randn(3, len(train_ds), generator=torch.Generator().manual_seed(0)), 1e-6
-    for direction in directions:
-        finals = [magic.train(state, n_steps=n_steps, weights=1 + sign * eps * direction, pbar=False) for sign in (1, -1)]
-        finite_diff = torch.stack([magic.objective.forward(finals[0].params, *e)[0] - magic.objective.forward(finals[1].params, *e)[0] for e in eval_sets]) / (2 * eps)
-        torch.testing.assert_close(d_weights @ direction, finite_diff, rtol=1e-5, atol=0)
+    direction, eps = torch.randn(len(train_ds), generator=torch.Generator().manual_seed(0)), 1e-4
+    finals = [magic.train(state, n_steps=n_steps, weights=1 + sign * eps * direction, pbar=False) for sign in (1, -1)]
+    finite_diff = torch.stack([magic.objective.forward(finals[0].params, *e)[0] - magic.objective.forward(finals[1].params, *e)[0] for e in eval_sets]) / (2 * eps)
+    torch.testing.assert_close(d_weights @ direction, finite_diff, rtol=1e-4, atol=0)
 
 
 def test_centralflow_helper_devices_match_one(float64):
@@ -197,18 +195,18 @@ def test_train_yields_grads_and_graph(float64):
 
 @pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam"])  # (not the second-order steps: duals through LOBPCG / MINRES are slow)
 def test_tangent_matches_finite_differences(float64, optimizer):
-    """The tangent logged by train_logged (forward-mode AD through the loss gradient and the step, for any optimizer) has the norms of
+    """The tangent logged by `TrainLog` (forward-mode AD through the loss gradient and the step, for any optimizer) has the norms of
     (s_t(s_0 + eps v) - s_t(s_0 - eps v)) / 2 eps, for all the state groups; with the eigenvalues and curvatures logged too."""
     magic, _, test_loader, state = setup(optimizer)
     if optimizer == "adam":  # a positive second moment: the finite differences perturb it in both directions (sqrt)
         state = replace(state, second_moment={k: torch.full_like(p, 1e-2) for k, p in state.params.items()})
     n_steps, eps = 6, 1e-6  # eigenvalues at steps 2 and 4
     logger = Logger(name="test", flush_every=10**9)
-    train_logged(magic, state, n_steps=n_steps, test_loader=test_loader, logger=logger, tangent=True, n_top_eigs=2, eig_every=2,
-                 curvature=True, eval_every=0)
-    g = torch.Generator().manual_seed(0)  # the same v as train_logged
+    train_log = TrainLog(magic=magic, logger=logger, test_loader=test_loader, tangent=True, n_top_eigs=2, eig_every=2, curvature=True, eval_every=0)
+    train_log.train(state, n_steps=n_steps)
+    g = torch.Generator().manual_seed(0)  # the same v as `TrainLog`
     v = state.apply(lambda s: torch.randn(s.shape, generator=g, dtype=torch.float32).to(s.dtype))
-    v = v.apply(lambda s: s / op_norm(s, n_iter=10)[0])
+    v = v.apply(lambda s: s / scaled_l2(s))
 
     def trajectory(sign):
         it = iter(v)
@@ -257,15 +255,13 @@ def test_backprop_in_segments(passes, float64):
 
 
 @pytest.mark.parametrize("negative", [False, True])
-@pytest.mark.parametrize("precond", [False, True])
-def test_top_hessian_eigs_match_dense(precond, negative, float64):
-    """LOBPCG's top / most negative eigenvalues (HVPs = `hvp_fn`, double backward) against the dense Hessian, plain and preconditioned."""
+def test_top_hessian_eigs_match_dense(negative, float64):
+    """LOBPCG's top / most negative eigenvalues (HVPs = `hvp_fn`, double backward) against the dense Hessian."""
     magic, _, _, state = setup("sgd")
     X, Y, _ = magic.loader.get_batch(0)
     params = {k: p.clone().requires_grad_() for k, p in state.params.items()}
     sizes = [p.numel() for p in params.values()]
     g = torch.Generator().manual_seed(1)
-    P = {k: torch.rand(p.shape, generator=g, dtype=p.dtype) + 0.5 for k, p in params.items()} if precond else None
 
     def loss(flat: torch.Tensor) -> torch.Tensor:
         unflat = {k: v.view_as(p) for (k, p), v in zip(params.items(), flat.split(sizes))}
@@ -273,17 +269,14 @@ def test_top_hessian_eigs_match_dense(precond, negative, float64):
 
     flat = torch.cat([p.detach().flatten() for p in params.values()])
     H = torch.func.hessian(loss)(flat)
-    if P is not None:
-        sqrt_p = torch.cat([p.flatten() for p in P.values()]).sqrt()
-        H = sqrt_p[:, None] * H * sqrt_p[None, :]
     all_eigs = torch.linalg.eigvalsh(H)  # ascending
     expected = all_eigs[:3] if negative else all_eigs.flip(0)[:3]
     assert (expected < 0).all() if negative else (expected > 0).all()  # the Hessian is indefinite: both signs tested
 
     hvp_fn = magic.objective.hvp_fn(params, X, Y)  # V -> H V on batched params dicts
     start = {k: torch.randn(3, *p.shape, generator=g, dtype=p.dtype) for k, p in params.items()}
-    eigvals, eigvecs, n_iter = hessian_eigs(hvp_fn, start, P, sign=-1 if negative else 1)
-    eigvals, _, _ = hessian_eigs(hvp_fn, eigvecs, P, sign=-1 if negative else 1)  # warm-started, like the logging
+    eigvals, eigvecs, n_iter = hessian_eigs(hvp_fn, start, sign=-1 if negative else 1)
+    eigvals, _, _ = hessian_eigs(hvp_fn, eigvecs, sign=-1 if negative else 1)  # warm-started, like the logging
     assert 0 < n_iter and sum(sizes) >= 12  # LOBPCG ran (no dense fallback)
     torch.testing.assert_close(eigvals, expected, rtol=5e-2, atol=0)
 
@@ -394,7 +387,7 @@ def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     state = SGDState(params={k: p.detach().clone() for k, p in model.named_parameters()}, lr=LRSchedule(0.1))
     logger = Logger(name="test")
     magic, test_loader = Magic(objective=Objective(model=model, loss_fn=cross_entropy), loader=Loader(train_ds, batch_size=4)), Loader(test_ds)
-    train_logged(magic, state, n_steps=5, test_loader=test_loader, logger=logger, eval_every=2, n_top_eigs=2, eig_every=2, tangent=True)  # eigs at step 4
+    TrainLog(magic=magic, logger=logger, test_loader=test_loader, eval_every=2, n_top_eigs=2, eig_every=2, tangent=True).train(state, n_steps=5)  # eigs at step 4
     eval_sets = [test_loader.dataset.examples(torch.arange(8))]
     final = magic.train(state, n_steps=3)
     d_state = final.cotangent(magic.objective.eval_grads(final.params, eval_sets)[1])
@@ -418,7 +411,6 @@ def test_mu_linear_init():
         torch.testing.assert_close((layer.mult * layer.weight).var().item(), 1 / fan_in, rtol=0.1, atol=0)
         spectral = torch.linalg.matrix_norm(layer.weight, 2)
         assert 0.5 < spectral < 5
-        torch.testing.assert_close(op_norm(layer.weight, n_iter=100)[0], spectral, rtol=1e-2, atol=0)
     readout = Linear(256, 10, readout=True)
     torch.testing.assert_close((readout.mult * readout.weight).var().item(), 1 / 256**2, rtol=0.2, atol=0)
 

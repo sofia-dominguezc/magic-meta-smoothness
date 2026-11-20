@@ -33,8 +33,7 @@ from tqdm import tqdm
 from main import Experiment
 from src.lobpcg import hessian_eigs
 from src.logging import Logger
-from src.optimizers import LRSchedule, SGDState
-from src.utils import dict_zip
+from src.optimizers import dict_zip, LRSchedule, SGDState
 
 
 def flat(d: dict[str, Tensor]) -> Tensor:
@@ -60,8 +59,7 @@ def edgeflow_vs_gd(exp_dir: Path, device: str = "cpu", eig_every: int = 10, eval
     gd_magic = replace(exp.magic, loader=replace(exp.loader, repeat=1))  # the same batch t as Edge Flow's substeps K t, ..., K t + K - 1
     start, n_steps = cfg.start, cfg.n_steps - cfg.start
     test_idx = exp.test_ds.subset(min(n_test, len(exp.test_ds)), index=0)
-    logger = Logger((f"Edge Flow (K = {K})" if is_edgeflow else "Heun") + f" vs GD; {exp.name}", smooth=False)
-    logger.log_panels = {"amplitude_along_u"}
+    logger = Logger((f"Edge Flow (K = {K})" if is_edgeflow else "Heun") + f" vs GD; {exp.name}", smooth=False, log_panels={"amplitude_along_u"})
 
     ef = exp.magic.train.trace(ef_state, n_steps=n_steps * K, start=start * K, pbar=False)
     gd = gd_magic.train.trace(gd_state, n_steps=n_steps, start=start, pbar=False)
@@ -99,7 +97,7 @@ def edgeflow_vs_gd(exp_dir: Path, device: str = "cpu", eig_every: int = 10, eval
                     logger.log(t, **{"cos_with_u/gd_gradient": (g @ u).abs() / g.norm()})
             if eval_every and ((t - start) % eval_every == 0 or g_gd is None):
                 for name, params in (("gd", s_gd.params), (other, s_ef.params)):
-                    logger.log(t, **{f"test_loss/{name}": exp.objective.eval_loss(params, exp.test_loader, test_idx)[0]})
+                    logger.log(t, **{f"test_loss/{name}": exp.objective.eval_loss(params, exp.test_loader.iter_batches(test_idx))[0]})
         if g_gd is not None and (t - start) % eig_every == 0:
             hvp_fn = gd_magic.objective.hvp_fn(s_gd.params, X, Y)
             if eigvec is None:

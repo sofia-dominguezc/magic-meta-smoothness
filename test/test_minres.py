@@ -4,10 +4,10 @@ import pytest
 import torch
 from torch.func import functional_call
 
-from src.lobpcg import hessian_eigs
-from src.objective import cross_entropy
+from src.lobpcg import flatten, hessian_eigs, unflatten
+from src.optimizers import dict_zip
+from src.objective import cross_entropy, hvp_from_grads
 from src.minres import minres
-from src.utils import dict_zip, flatten, hvp_from_grads, unflatten
 from test.test_magic import setup
 
 

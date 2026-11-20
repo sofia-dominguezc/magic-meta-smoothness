@@ -8,10 +8,10 @@ import torch
 from torch import Tensor
 
 from src.minres import minres
-from src.utils import HVP, dict_zip, flatten, hvp_from_forward, hvp_from_grads, unflatten
-from src.lobpcg import hessian_eigs
+from src.lobpcg import flatten, hessian_eigs, unflatten
+from src.objective import HVP, hvp_from_forward, hvp_from_grads
+from src.optimizers import Forward, OptimState, StepOutput, dict_zip
 from src.sdcp import sdcp
-from src.optimizers import Forward, OptimState, StepOutput
 
 
 class LossGraph(NamedTuple):
@@ -147,26 +147,23 @@ class EdgeFlowState(SecondOrderState):
 
 @dataclass(kw_only=True)
 class CentralFlowState(SecondOrderState):
-    """Central flow of GD with learning rate `lr` (Cohen et al. 2024, arXiv:2410.24206), SUBSTEPS Euler steps per GD step:
+    """Central flow of GD with learning rate `lr` (Cohen et al. 2024, arXiv:2410.24206)
         params <- params - lr / SUBSTEPS * (grads + 1/2 * d<Sigma, H>/d(params))
-    Sigma = U X U^T, the covariance of GD's oscillations: U the critical eigenvectors (eigenvalues above THRESHOLD / lr),
-    X the `sdcp` solution that keeps U^T H U <= 2 / lr after the step.
-    `step` = `_top_eigs` (LOBPCG) -> `_pair_curvatures` (u_i^T H u_j and their gradients, U fixed) -> `_flow_update` (sdcp, the
-    Euler step). `vjp` = the adjoint of each stage, from the curvatures `step` stored in the next state, plus the derivative of U
-    (`_eigvecs_vjp`: one MINRES solve per critical eigenvector)."""
+    Sigma = U X U^T, the covariance of GD's oscillations: U the critical eigenvectors,
+    X the `sdcp` solution that keeps U^T H U <= 2 / lr after the step"""
 
     SUBSTEPS: ClassVar[int] = 4
-    N_EIGS: ClassVar[int] = 8  # at most this many critical eigenvalues, else the step fails (tracked: one more than the last step's, at least 2)
+    N_EIGS: ClassVar[int] = 8  # at most this many critical eigenvalues
     THRESHOLD: ClassVar[float] = 1.95  # an eigenvalue is critical above THRESHOLD / lr
     EIG_RTOL: ClassVar[float] = 1e-3  # of LOBPCG
     VJP_RTOL: ClassVar[float] = 1e-3  # of MINRES
 
     aux = ("eigvecs", "curvatures", "curvature_grads", "stats")
-    eigvecs: dict[str, Tensor] = field(default_factory=dict)  # {name: [n, *shape]} the tracked eigenvectors (warm start), the critical ones first; None -> random
-    curvatures: dict[str, Tensor] = field(default_factory=dict)  # {"curvatures": [k, k]} u_i^T H u_j of the critical eigenvectors, of the last step
-    curvature_grads: dict[str, Tensor] = field(default_factory=dict)  # {name: [k, k, *shape]} their gradients in the params (U fixed)
+    eigvecs: dict[str, Tensor] = field(default_factory=dict)  # {name: [n, *shape]}, critical ones first
+    curvatures: dict[str, Tensor] = field(default_factory=dict)  # {"curvatures": [k, k]} u_i^T H u_j
+    curvature_grads: dict[str, Tensor] = field(default_factory=dict)  # {name: [k, k, *shape]}
     compile: bool = False  # torch.compile the HVPs of LOBPCG
-    devices: tuple[str, ...] = ()  # helper devices: LOBPCG's HVPs and the pairs of critical eigenvectors are dealt among them and this device
+    devices: tuple[str, ...] = ()  # helper devices for LOBPCG's HVPs and pairs of critical eigenvectors
 
     def __post_init__(self):
         super().__post_init__()
@@ -207,29 +204,39 @@ class CentralFlowState(SecondOrderState):
 
     @staticmethod
     def _dealt(n_items: int, n_devices: int) -> list[tuple[int, list[int]]]:
-        """(device, its items) round-robin, this device (0) last so that nothing is moved to a helper once it is busy"""
+        """(device, its items) round-robin, this device (0) last
+        so that nothing is moved to a helper once it is busy"""
         return [(d, list(range(d, n_items, n_devices))) for d in reversed(range(n_devices))]
 
     def _on_device(
         self, forward_fn: Forward, device: str, inputs: Sequence[Tensor] = ()
     ) -> tuple[Forward, dict[str, Tensor], list[Tensor]]:
         """`forward_fn`, the params and `inputs` copied to `device`"""
-        assert isinstance(forward_fn, partial), "helper devices: the batch is moved from the partial's arguments"
+        assert isinstance(forward_fn, partial), "helper devices need to move the batch"
         copies = {id(x): x.detach().to(device).requires_grad_() for x in (*self.params.values(), *inputs)}
         move = lambda x: copies.get(id(x), x.detach().to(device)) if isinstance(x, Tensor) else x
         params = {k: move(p) for k, p in self.params.items()}
-        device_forward = partial(forward_fn.func, *map(move, forward_fn.args), **{k: move(x) for k, x in forward_fn.keywords.items()})
+        device_forward = partial(
+            forward_fn.func,
+            *map(move, forward_fn.args),
+            **{k: move(x) for k, x in forward_fn.keywords.items()},
+        )
         return device_forward, params, [copies[id(x)] for x in inputs]
 
     def _hvp_fns(self, forward_fn: Forward) -> list[tuple[torch.device | str, HVP]]:
         """H V by torch.func (no graph) on this device, then on each helper device"""
-        hvp_fns = [(next(iter(self.params.values())).device, hvp_from_forward(forward_fn, self.params, self.compile))]
+        hvp_fns = [
+            (next(iter(self.params.values())).device,
+            hvp_from_forward(forward_fn, self.params, self.compile)),
+        ]
         for device in self.devices:
             device_forward, params, _ = self._on_device(forward_fn, device)
             hvp_fns.append((device, hvp_from_forward(device_forward, params, self.compile)))
         return hvp_fns
 
-    def _loss_graphs(self, forward_fn: Forward, grads: dict[str, Tensor], inputs: Sequence[Tensor] = ()) -> list[LossGraph]:
+    def _loss_graphs(
+        self, forward_fn: Forward, grads: dict[str, Tensor], inputs: Sequence[Tensor] = ()
+    ) -> list[LossGraph]:
         """The graph of `grads` (for HVPs with a graph), then its copy on each helper device"""
         graphs = [LossGraph(self.params, hvp_from_grads(grads, self.params), inputs)]
         for device in self.devices:
@@ -239,7 +246,9 @@ class CentralFlowState(SecondOrderState):
         return graphs
 
     @classmethod
-    def _chunked_hvp(cls, hvp_fns: Sequence[tuple[torch.device | str, HVP]], V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]:
+    def _chunked_hvp(
+        cls, hvp_fns: Sequence[tuple[torch.device | str, HVP]], V: dict[str, Tensor], create_graph: bool = False
+    ) -> dict[str, Tensor]:
         """H V in calls of 3 vectors (zero-padded to a multiple: one size, so one compilation) dealt among `hvp_fns`.
         LOBPCG applies H to 3k vectors at a time (its k eigenvector estimates, residuals and directions)."""
         n_vectors = len(next(iter(V.values())))
@@ -250,7 +259,10 @@ class CentralFlowState(SecondOrderState):
             device, hvp_fn = hvp_fns[d]
             for c in items:
                 results[c] = hvp_fn({k: v.to(device) for k, v in chunks[c].items()})
-        return {k: torch.cat([results[c][k].to(v.device) for c in range(len(chunks))])[:n_vectors] for k, v in V.items()}
+        return {
+            k: torch.cat([results[c][k].to(v.device) for c in range(len(chunks))])[:n_vectors]
+            for k, v in V.items()
+        }
 
     # The forward step
 
@@ -267,11 +279,15 @@ class CentralFlowState(SecondOrderState):
     def _curvature(
         graph: LossGraph, u: dict[str, Tensor], v: dict[str, Tensor], create_graph: bool = False
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """u^T H v [] and its gradient in the params {name: [*shape]} (u, v held fixed), on the graph's device"""
+        """u^T H v [] and its gradient {name: [*shape]}, on the graph's device"""
         H_v = graph.hvp_fn(v, create_graph=True)
         curvature = torch.stack([(u[k] * H_v[k]).sum() for k in H_v]).sum()
-        grads = torch.autograd.grad(list(H_v.values()), list(graph.params.values()), [u[k] for k in H_v], retain_graph=True, create_graph=create_graph)
-        return (curvature if create_graph else curvature.detach()), dict(zip(graph.params, grads))
+        curvature_grad = torch.autograd.grad(
+            list(H_v.values()), list(graph.params.values()), [u[k] for k in H_v],
+            retain_graph=True, create_graph=create_graph,
+        )
+        curvature = curvature if create_graph else curvature.detach()
+        return curvature, dict(zip(graph.params, curvature_grad))
 
     @staticmethod
     def _symmetric(pairs: Tensor, k: int) -> Tensor:
@@ -313,8 +329,12 @@ class CentralFlowState(SecondOrderState):
         k = len(curvatures)
         reg_grads = {name: g + self.wd * p for name, (p, g) in dict_zip(self.params, grads).items()}
         flat_grads = {name: C_grad.flatten(2) for name, C_grad in curvature_grads.items()}  # [k, k, #params]
-        drift = torch.stack([C_grad @ g.flatten() for C_grad, g in dict_zip(flat_grads, reg_grads).values()]).sum(0)  # [k, k]
-        gram = torch.stack([torch.einsum("ijp,klp->ijkl", C_grad, C_grad) for C_grad in flat_grads.values()]).sum(0)  # [k, k, k, k]
+        drift = torch.stack([  # [k, k]
+            C_grad @ g.flatten() for C_grad, g in dict_zip(flat_grads, reg_grads).values()
+        ]).sum(0)
+        gram = torch.stack([  # [k, k, k, k]
+            torch.einsum("ijp,klp->ijkl", C_grad, C_grad) for C_grad in flat_grads.values()
+        ]).sum(0)
         edge = torch.eye(k).to(curvatures) * (2 / lr - self.wd)
         X = sdcp(edge - (curvatures - step_size * drift), step_size / 2 * gram)
         params = {
@@ -365,7 +385,8 @@ class CentralFlowState(SecondOrderState):
         return [torch.stack(d) for d in zip(*per_fn)]
 
     def _pair_curvatures_vjp(
-        self, graphs: Sequence[LossGraph], critical: dict[str, Tensor], d_curvatures: Tensor, d_curvature_grads: dict[str, Tensor]
+        self, graphs: Sequence[LossGraph], critical: dict[str, Tensor],
+        d_curvatures: Tensor, d_curvature_grads: dict[str, Tensor],
     ) -> tuple[list[Tensor], dict[str, Tensor]]:
         """Adjoint of `_pair_curvatures`, returns `d inputs` and `d critical eigenvectors`"""
         k = d_curvatures.shape[1]
@@ -394,9 +415,11 @@ class CentralFlowState(SecondOrderState):
                 d_critical = [a + b for a, b in zip(d_critical, d_pair[len(d_inputs) :])]
                 del curvature, curvature_grads, d_pair
             results.append((d_inputs, d_critical))
+
+        device, N = graphs[0].device, len(graphs[0].inputs)
         return (  # sum gradients over all pairs
-            [torch.stack([d_x[n].to(graphs[0].device) for d_x, _ in results]).sum(0) for n in range(len(graphs[0].inputs))],
-            {name: torch.stack([d_u[n].to(graphs[0].device) for _, d_u in results]).sum(0) for n, name in enumerate(critical)},
+            [torch.stack([d_x[n].to(device) for d_x, _ in results]).sum(0) for n in range(N)],
+            {name: torch.stack([d_u[n].to(device) for _, d_u in results]).sum(0) for n, name in enumerate(critical)},
         )
 
     def _eigvecs_vjp(
@@ -427,7 +450,8 @@ class CentralFlowState(SecondOrderState):
         return d_inputs
 
     def vjp(
-        self, t: int, forward_fn: Forward, inputs: Sequence[Tensor], cotangents: OptimState, next_state: OptimState | None = None
+        self, t: int, forward_fn: Forward, inputs: Sequence[Tensor],
+        cotangents: OptimState, next_state: OptimState | None = None,
     ) -> Sequence[Tensor]:
         """Backward of `step`, re-using the critical eigenvectors and curvatures from `next_state` (required).
         Runs in stages: first the adjoint of `_flow_update`, then of `_pair_curvatures`, then `_eigvecs_vjp`"""

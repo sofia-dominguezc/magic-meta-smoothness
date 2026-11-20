@@ -1,6 +1,9 @@
 import json
+from pathlib import Path
+
 import click
 import pytest
+from matplotlib.figure import Figure
 
 from click.testing import CliRunner
 import torch
@@ -10,13 +13,18 @@ from experiments.tune_lr import tune_lr
 from main import Experiment, main
 from src.second_order import CentralFlowState
 
+@pytest.fixture(autouse=True)
+def no_rendering(monkeypatch):
+    """The plots are built but not drawn (most of a CLI test's time): `savefig` only creates the file"""
+    monkeypatch.setattr(Figure, "savefig", lambda self, path, **kwargs: Path(path).touch())
+
 
 def test_cli_end_to_end(tmp_path):
     """new -> tune_lr -> retrain (twice) -> train -> magic -> evaluate on a tiny CPU config, with momentum.
     MAGIC's predictions should agree with the retrained models (in float64: the loss changes are tiny)."""
     d = str(tmp_path)
     runner = CliRunner()
-    result = runner.invoke(main, ["new", d, "--dataset", "majority", "--model", "mlp", "--n-steps", "12", "--optimizer", "momentum", "--dtype", "fp64"], catch_exceptions=False)
+    result = runner.invoke(main, ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--n-steps", "12", "--optimizer", "momentum", "--dtype", "fp64"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert tune_lr(tmp_path, lrs=[0.05, 0.1], steps=6, show=False, magic=True, n_test=5) in (0.05, 0.1)
     assert (tmp_path / "lr_tuning_curves.png").exists() and (tmp_path / "lr_tuning_magic.png").exists()
@@ -71,7 +79,7 @@ def test_start_and_randn(tmp_path):
     d = str(tmp_path)
     runner = CliRunner()
     for args in [
-        ["new", d, "--dataset", "majority", "--model", "mlp", "--loss", "mse", "--lr", "0.1", "--n-steps", "12", "--start", "6", "--dtype", "fp64"],
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--loss", "mse", "--lr", "0.1", "--n-steps", "12", "--start", "6", "--dtype", "fp64"],
         ["retrain", d, "--kind", "randn", "--alpha", "0.01", "--n-subsets", "3"],
         ["train", d, "--eval-every", "0", "--tangent", "--curvature", "--eig-every", "3", "--no-show"],
         ["magic", d, "--no-show"],
@@ -101,7 +109,7 @@ def test_sharpness(tmp_path):
     d = str(tmp_path)
     runner = CliRunner()
     for args in [
-        ["new", d, "--dataset", "majority", "--model", "mlp", "--optimizer", "sharpness", "--lr", "1", "--n-steps", "6", "--dtype", "fp64"],
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--optimizer", "sharpness", "--lr", "1", "--n-steps", "6", "--dtype", "fp64"],
         ["train", d, "--eval-every", "3", "--n-test", "20", "--no-show"],
         ["magic", d, "--n-test", "5", "--no-show"],
     ]:
@@ -127,7 +135,7 @@ def test_bf16(tmp_path):
     d = str(tmp_path)
     runner = CliRunner()
     for args in [
-        ["new", d, "--dataset", "majority", "--model", "mlp", "--lr", "0.1", "--n-steps", "4", "--dtype", "bf16", "--lr-schedule", "cosine", "--warmup", "2"],
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--lr", "0.1", "--n-steps", "4", "--dtype", "bf16", "--lr-schedule", "cosine", "--warmup", "2"],
         ["retrain", d, "--n-subsets", "2"],
         ["train", d, "--eval-every", "2", "--n-test", "50", "--num-top-eigs", "1", "--eig-every", "1", "--tangent", "--no-show"],
         ["magic", d, "--no-show"],
@@ -150,7 +158,7 @@ def test_centralflow(tmp_path):
     d = str(tmp_path)
     runner = CliRunner()
     for args in [
-        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--optimizer", "centralflow", "--lr", "2", "--n-steps", "4", "--dtype", "fp64"],
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--optimizer", "centralflow", "--lr", "2", "--n-steps", "3", "--dtype", "fp64"],
         ["train", d, "--eval-every", "2", "--n-test", "20", "--no-show"],
         ["magic", d, "--n-test", "5", "--no-show"],
     ]:
@@ -160,7 +168,7 @@ def test_centralflow(tmp_path):
     assert set(final) == {"params", "lr", "wd", "eigvecs", "curvatures", "curvature_grads", "stats", "compile", "devices"}
     assert all(v.shape == (2, *final["params"][k].shape) for k, v in final["eigvecs"].items())  # n_critical 1 + 1
     logged = torch.load(tmp_path / "full_model" / "metrics.pt", weights_only=True)
-    n_substeps = 4 * CentralFlowState.SUBSTEPS
+    n_substeps = 3 * CentralFlowState.SUBSTEPS
     assert all(len(logged[k]["step"]) == n_substeps for k in ("eig/1", "eig/2", "eig_iters", "n_critical", "oscillation"))
     assert (logged["n_critical"]["value"] == 1).all()
     torch.testing.assert_close(logged["eig/1"]["value"][4:12], torch.ones(8), rtol=1e-2, atol=0)  # on the edge (batches 1 and 2)
@@ -175,7 +183,7 @@ def test_newton(tmp_path):
     d = str(tmp_path)
     runner = CliRunner()
     for args in [
-        ["new", d, "--dataset", "majority", "--model", "mlp", "--optimizer", "newton", "--lr", "1", "--n-steps", "6", "--dtype", "fp64"],
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--optimizer", "newton", "--lr", "1", "--n-steps", "6", "--dtype", "fp64"],
         ["train", d, "--num-top-eigs", "1", "--eig-every", "2", "--eval-every", "3", "--n-test", "20", "--no-show"],
         ["magic", d, "--n-test", "5", "--no-show"],
     ]:
@@ -201,7 +209,7 @@ def test_prune(tmp_path):
     d = str(tmp_path)
     runner = CliRunner()
     for args in [
-        ["new", d, "--dataset", "majority", "--model", "mlp", "--loss", "mse", "--lr", "0.1", "--n-steps", "8", "--start", "2", "--dtype", "fp64"],
+        ["new", d, "--dataset", "majority", "--model", "mlp", "--width", "16", "--loss", "mse", "--lr", "0.1", "--n-steps", "8", "--start", "2", "--dtype", "fp64"],
         ["retrain", d, "--kind", "randn", "--alpha", "0.01", "--n-subsets", "3"],
         ["train", d, "--eval-every", "0", "--no-show"],
         ["magic", d, "--n-test", "5", "--n-subsets", "2", "--no-show"],

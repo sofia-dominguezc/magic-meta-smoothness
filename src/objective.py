@@ -1,20 +1,17 @@
-"""The loss as a function of the model parameters on given examples (`Objective`), with its derivatives, and the losses and metrics."""
+"""The loss as a function of the model parameters on given examples (`Objective`), its derivatives (gradients, Hessian-vector
+products), and the losses and metrics."""
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Callable, Iterable, Protocol, Sequence
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.func import functional_call
-
-from src.data import Loader
-from src.utils import HVP, hvp_from_grads
+from torch.func import functional_call, grad, jvp, vmap
 
 
 class LossFn(Protocol):
     """out: [B, C], int labels: [B] -> per-example loss: [B]"""
-
     def __call__(self, out: Tensor, Y: Tensor) -> Tensor: ...
 
 
@@ -36,6 +33,47 @@ def metrics(out: Tensor, Y: Tensor) -> dict[str, Tensor]:
     correct = out.gather(1, Y[:, None])[:, 0]
     best_other = out.scatter(1, Y[:, None], float("-inf")).max(1).values
     return {"acc": (out.argmax(1) == Y).to(out.dtype), "margin": correct - best_other}
+
+
+class HVP(Protocol):
+    """V {name: [m, *shape]} -> H V (batched over the leading dim m), or a single vector {name: [*shape]} -> H v;
+    `create_graph=True` for a differentiable H V"""
+    def __call__(self, V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]: ...
+
+
+def hvp_from_grads(grads: dict[str, Tensor], params: dict[str, Tensor]) -> HVP:
+    """V -> H V = d(grads . V) / d params by stateful 2nd-order autograd: `grads` computed with create_graph at the leaves `params`"""
+    def hvp_fn(V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]:
+        batched = next(iter(V.values())).ndim > next(iter(params.values())).ndim
+        return torch.autograd.grad(
+            list(grads.values()), params, [V[k] for k in grads],
+            retain_graph=True, create_graph=create_graph, is_grads_batched=batched,
+        )
+
+    return hvp_fn
+
+
+def _forward_hvp(forward_fn: Callable, params: dict[str, Tensor], V: dict[str, Tensor]) -> dict[str, Tensor]:
+    """H V for V {name: [m, *shape]}, forward-over-reverse"""
+    grad_fn = grad(lambda p: forward_fn(p)[0])
+    return vmap(lambda v: jvp(grad_fn, (params,), (v,))[1])(V)
+
+
+_compiled_forward_hvp = torch.compile(_forward_hvp)  # (module-level: one cache for every step's `forward_fn`)
+
+
+def hvp_from_forward(forward_fn: Callable, params: dict[str, Tensor], compile: bool = False) -> HVP:
+    """V -> H V of the loss `forward_fn(params)[0]` by torch.func, without a graph (`compile`: torch.compiled, once per number of vectors)"""
+    params = {k: p.detach() for k, p in params.items()}
+    hvp = _compiled_forward_hvp if compile else _forward_hvp
+
+    def hvp_fn(V: dict[str, Tensor], create_graph: bool = False) -> dict[str, Tensor]:
+        assert not create_graph
+        if next(iter(V.values())).ndim > next(iter(params.values())).ndim:
+            return hvp(forward_fn, params, V)
+        return {k: Hv[0] for k, Hv in hvp(forward_fn, params, {k: v[None] for k, v in V.items()}).items()}
+
+    return hvp_fn
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -63,16 +101,17 @@ class Objective:
         return (losses if weights is None else weights * losses).mean(), out
 
     @torch.no_grad()
-    def eval_loss(self, params: dict[str, Tensor], loader: Loader, indices: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
-        """Mean loss and metrics of `params` on the examples `indices` of `loader`, accumulated batch by batch"""
-        n = len(indices)
-        loss, mean_metrics = torch.zeros((), device=loader.device), {}
-        for X, Y in loader.iter_batches(indices):
-            batch_loss, out = self.forward(params, X, Y)
-            loss += batch_loss * len(X) / n
-            for k, v in metrics(out, Y).items():
-                mean_metrics[k] = mean_metrics.get(k, 0) + v.sum() / n
-        return loss, mean_metrics
+    def eval_loss(self, params: dict[str, Tensor], batches: Iterable[tuple[Tensor, Tensor]]) -> tuple[Tensor, dict[str, Tensor]]:
+        """Mean loss and metrics of `params` over the examples of `batches` (X, Y)"""
+        n_examples = 0
+        sums: dict[str, Tensor] = {}
+        for X, Y in batches:
+            losses, out = self.example_losses(params, X, Y)
+            for k, v in {"loss": losses, **metrics(out, Y)}.items():
+                sums[k] = sums.get(k, 0) + v.sum()
+            n_examples += len(X)
+        means = {k: total / n_examples for k, total in sums.items()}
+        return means.pop("loss"), means
 
     def hvp_fn(self, params: dict[str, Tensor], X: Tensor, Y: Tensor) -> HVP:
         """`hvp_from_grads` of the mean loss of the batch (X, Y) at `params`"""

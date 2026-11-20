@@ -24,7 +24,8 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from main import Experiment, backprop_logged, to_device, train_logged
+from main import Experiment
+from src.magic import TrainLog, backprop_logged, to_device
 from src.logging import Logger, ema_smooth, fig_title
 
 Metrics = dict[str, dict[str, Tensor]]  # Logger.metrics()
@@ -107,11 +108,11 @@ def tune_lr(
     for lr, steps in zip(tqdm(lrs, desc="learning rates"), steps_per_lr):
         init_state = replace(exp.init_state, lr=replace(exp.init_state.lr, lr=lr))
         logger = Logger(f"lr {lr:g}", smooth=False, total_norms=True, step_scale=exp.substeps)
-        final = train_logged(exp.magic, init_state, n_steps=steps, test_loader=exp.test_loader, logger=logger,
-                             eval_every=eval_every or max(1, steps // 20), n_test=None if full_test else min(len(all_test), 1000),
-                             ema_gamma=ema_gamma, ema_decay=ema_decay)
+        train_log = TrainLog(magic=exp.magic, logger=logger, test_loader=exp.test_loader, eval_every=eval_every or max(1, steps // 20),
+                             n_test=None if full_test else min(len(all_test), 1000), ema_gamma=ema_gamma, ema_decay=ema_decay)
+        final = train_log.train(init_state, n_steps=steps)
         train_runs[lr] = logger.metrics()
-        loss, metrics = exp.objective.eval_loss({k: p.to(device) for k, p in final.params.items()}, exp.test_loader, all_test)
+        loss, metrics = exp.objective.eval_loss({k: p.to(device) for k, p in final.params.items()}, exp.test_loader.iter_batches(all_test))
         losses.append(loss.item() if math.isfinite(loss.item()) else math.inf)
         msg = f"  lr {lr:g}: test loss {losses[-1]:.4f}, final acc {metrics['acc'].item():.3f}, max acc"
         for suffix, label in acc_models.items():
@@ -150,7 +151,7 @@ def tune_lr(
     title = f"{exp.cfg.model} on {exp.cfg.dataset}, {exp.cfg.optimizer}, {steps_label}"
     norm_names = {"params", "grads"}
     names = [n for n in dict.fromkeys(n for m in train_runs.values() for n in m)
-             if n not in ("lr", "gpu_gb") and ("/ema" not in n or n.startswith(("test_loss/", "test_acc/")))]
+             if n not in ("lr", "gpu_gb", "gpu_util") and ("/ema" not in n or n.startswith(("test_loss/", "test_acc/")))]
     names.sort(key=lambda n: (n in norm_names, n.startswith("test_")))  # train metrics, test metrics, norms (stable)
     plot_runs(train_runs, names, title, exp_dir / "lr_tuning_curves.png", log_names=norm_names)
     if flow_time:

@@ -15,7 +15,7 @@ A saved state (*.pt below) is `asdict(OptimState)`, loaded by `Experiment.load_s
                     checkpoints/<t>.pt (`train --checkpoint-every`): the state at the optimizer step t, from which `magic`
                     replays the steps up to the next one; resume.pt: the EMA and tangent at the last checkpoint of a killed
                     `train`, which the next `train` continues from;
-                    metrics.pt + plots: the logs of `train` (see `train_logged`), rewritten at every checkpoint
+                    metrics.pt + plots: the logs of `train` (see `magic.TrainLog`), rewritten at every checkpoint
   DIR/retrained/    one dir per retrained model: final.pt, perturbation.pt = {weights [N], kind, alpha};
                     losses.json: its loss on every eval set evaluated so far (`Experiment.eval_losses`, also in DIR/full_model:
                     the evaluations read it instead of the state, so `prune` can delete the states)
@@ -36,22 +36,19 @@ import shutil
 import click
 from pathlib import Path
 import matplotlib.pyplot as plt
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from functools import cached_property
 
 import torch
-import torch.autograd.forward_ad as fwAD
 from torch import Tensor
 
 from src.data import DATASETS, Dataset, Images, Loader
-from src.lobpcg import hessian_eigs
-from src.magic import Magic
-from src.objective import LOSSES, Objective, metrics
-from src.utils import dict_zip, hvp_from_grads
+from src.magic import Magic, TrainLog, backprop_logged, to_device
+from src.objective import LOSSES, Objective
 from src.models import MODELS
 from src.optimizers import AdamState, HeunState, LRSchedule, OptimState, SGDMomentumState, SGDState
 from src.second_order import CentralFlowState, EdgeFlowState, NewtonState, SecondOrderState, SharpnessState
-from src.logging import Logger, fig_title, op_norm, total_l2
+from src.logging import Logger, fig_title
 
 
 def parse_devices(device: str) -> list[str]:
@@ -248,7 +245,7 @@ class Experiment:
                 state = self.magic.train(state, n_steps=1, start=start + n_steps, pbar=False)
             params = {k: t.to(self.device) for k, t in state.params.items()}
             for i in missing:
-                cache[keys[i]] = self.objective.eval_loss(params, self.test_loader, eval_sets[i])[0].item()
+                cache[keys[i]] = self.objective.eval_loss(params, self.test_loader.iter_batches(eval_sets[i]))[0].item()
             path.write_text(json.dumps(saved, indent=1))
         return torch.tensor([cache[k] for k in keys])
 
@@ -271,214 +268,6 @@ def load_renamed(path: Path) -> dict:
     TODO: delete it and `OLD_NAMES` (plain torch.load instead) once no results from before 2026-11-19 are read."""
     saved = torch.load(path, weights_only=True)
     return {"/".join(OLD_NAMES.get(part, part) for part in key.split("/")): value for key, value in saved.items()}
-
-
-def to_device(tensors, device):
-    """The nested dicts / lists / states `tensors` with every tensor on `device`"""
-    if isinstance(tensors, Tensor):
-        return tensors.to(device)
-    if isinstance(tensors, OptimState):
-        return tensors.apply(lambda t: t.to(device))
-    if isinstance(tensors, dict):
-        return {k: to_device(v, device) for k, v in tensors.items()}
-    if isinstance(tensors, list):
-        return [to_device(v, device) for v in tensors]
-    return tensors
-
-
-def train_logged(
-    magic: Magic, init_state: OptimState, *, n_steps: int, start: int = 0, test_loader: Loader, logger: Logger,
-    n_top_eigs: int = 0, n_neg_eigs: int = 0, eig_every: int = 10, curvature: bool = False, tangent: bool = False,
-    eval_every: int = 100, n_test: int | None = None, ema_gamma: float | None = None, ema_decay: float | None = None,
-    checkpoint_every: int = 0, save_dir: Path | None = None,
-) -> OptimState:
-    """Train the full model (`Magic.train` with its own logs: loss, metrics, op norms of the params and grads, the step's stats)
-    with more logs from the states and gradients it yields. By default only the ones that need no second derivative:
-    - "<name>/ema": the loss and metrics with the power-function EMA of the params of Karras et al. 2024 (arXiv:2312.02696:
-      the weight of s_t is proportional to t^`ema_gamma`, so the EMA at step T averages its last ~1/gamma: gamma 16.97 is a
-      relative std width of 5% of the training, t counted from step 0; kept here, not in the state); "test_<name>/ema": the
-      test loss and metrics at the EMA. Its first value is the params at `start` (standing for the steps before)
-    - "test_<name>": on `n_test` random test examples every `eval_every` steps (the whole test set at the last step)
-    - "grad_displacement": ||g_t - g_{t-1}|| / ||g_{t-1}|| of the batch gradients, logged at t
-    - "lr" if scheduled
-    With second derivatives (`create_graph`: the forward isn't compiled):
-    - "eig/i": top (i > 0) / most negative (i < 0) eigenvalues of the Hessian of the batch loss (unscaled: not of the preconditioned
-      Hessian), "eigvec/i" their norms, every `eig_every` steps. The eigenpair a 2nd-order step computes (sharpness: the top, newton:
-      the most negative) is logged at every step; LOBPCG only runs for 2 or more eigenpairs of that sign.
-      "eig/threshold": the stability threshold on the same scale, `stability_threshold` / step size P (when P is a scalar: not adam)
-    - `curvature`: "<direction>_hess/Hv" = ||H v|| / ||v|| and "<direction>_hess/vHv" = v^T H v / v^T v of the Hessian H of the batch
-      loss along v = the batch gradient ("grad"), the tangent ("tangent") and params - EMA ("ema": the short-term EMA with decay
-      `ema_decay`, kept here too; "test_<name>/ema_short": the test loss and metrics at it), every `eig_every` steps, one HVP
-      each (vHv of the gradient: the batch sharpness)
-    - "tangent": the norms of ds_t/ds_0 v for a random v, propagated by forward-mode AD through the training (the loss gradient
-      and the step), for any optimizer
-    `checkpoint_every`: save the state to `save_dir`/checkpoints/<t>.pt every this many steps, the logs so far with their plots
-    to `save_dir`/metrics.pt (as `logger.finish`), and the EMA, tangent and last gradient to `save_dir`/resume.pt, which the training continues from if it exists.
-    Returns the trained state."""
-    second_order = {1: "sharpness"} if isinstance(init_state, (SharpnessState, EdgeFlowState)) \
-        else {-1: "min_eig"} if isinstance(init_state, NewtonState) \
-        else {}
-    ks = {sign: k for sign, k in ((1, n_top_eigs), (-1, n_neg_eigs)) if k > 1 or k == 1 and sign not in second_order}  # sign -> eigenpairs by LOBPCG
-    stored = {sign: name for sign, name in second_order.items() if sign not in ks}  # sign -> the stat of the eigenpair the step keeps (aux `eigvec`)
-    eos = init_state.stability_threshold
-    warm: dict[int, dict[str, Tensor]] = {}  # sign -> eigenvectors [k, *shape] per param, LOBPCG's warm start
-    ema: dict[str, Tensor] | None = None  # the short-term EMA of the params through s_t (decay `ema_decay`)
-    pema: dict[str, Tensor] | None = None  # the power-function EMA (`ema_gamma`)
-    prev_grads: dict[str, Tensor] | None = None  # g_{t-1}, for "grad_displacement"
-
-    v: OptimState | None = None  # the tangent ds_t/ds_0 v (plain tensors)
-    hook = None
-    if tangent:
-        g = torch.Generator().manual_seed(start)
-        v = init_state.apply(lambda s: torch.randn(s.shape, generator=g, dtype=torch.float32).to(magic.device, s.dtype))
-        v = v.apply(lambda s: s / op_norm(s, n_iter=10)[0])
-        dual_level: list[int] = []
-
-        def hook(state: OptimState) -> OptimState:
-            """Between a step and the next forward: read the tangent the step propagated to the new state (s_{t+1} as a
-            dual of the level entered before step t's forward), close that level, and attach it to the detached state in
-            a new level, for the next forward and step."""
-            nonlocal v
-            assert v is not None
-            if dual_level:
-                tangents = [fwAD.unpack_dual(s).tangent for s in state]
-                # detach: else the tangent keeps the step's graph alive, and with
-                # create_graph the whole double-backward graph, growing every step
-                v = state.unflatten([tan.detach() for tan in tangents])
-                fwAD.exit_dual_level()
-                dual_level.pop()
-            state = state.apply(lambda s: s.detach())
-            dual_level.append(fwAD.enter_dual_level())
-            return state.unflatten([fwAD.make_dual(s, tan) for s, tan in zip(state, v)])
-
-    def log_eigs(t: int, ids: list[int], eigvals: Tensor, eigvecs: dict[str, Tensor]):
-        """Log "eig/i" and the norms "eigvec/i" of the eigenpairs `ids` (eigvecs: [k, *shape] per param)"""
-        logger.log(t, **{f"eig/{i}": lam for i, lam in zip(ids, eigvals.unbind())})
-        for j, i in enumerate(ids):
-            logger.log_norms(t, f"eigvec/{i}", {name: vec[j] for name, vec in eigvecs.items()})
-
-    def log_curvature(t: int, name: str, v: dict[str, Tensor], hvp_fn):
-        """Log "<name>_hess/Hv" = ||H v|| / ||v|| and "<name>_hess/vHv" = v^T H v / v^T v (one HVP)"""
-        Hv = hvp_fn(v)
-        vv = torch.stack([u.pow(2).sum() for u in v.values()]).sum()
-        vHv = torch.stack([(u * hu).sum() for u, hu in dict_zip(v, Hv).values()]).sum()
-        HvHv = torch.stack([hu.pow(2).sum() for hu in Hv.values()]).sum()
-        logger.log(t, **{f"{name}_hess/Hv": (HvHv / vv).sqrt(), f"{name}_hess/vHv": vHv / vv})
-
-    def log_threshold(t: int, state: OptimState):
-        """"eig/threshold" = stability threshold / step size, if the step size is a scalar. A second-order state's `precond`
-        uses the stats of the step that produced it (step t - 1, at s_{t-1}): logged at t - 1, like its eigenpair"""
-        if isinstance(state, SecondOrderState):
-            if t == start:
-                return  # (no stats yet)
-            t -= 1
-        P = next(iter(state.precond(t).values()))
-        if not isinstance(P, Tensor) or P.ndim == 0:
-            logger.log(t, **{"eig/threshold": torch.as_tensor(eos / P, dtype=torch.get_default_dtype())})
-
-    first = start  # the step the training (re)starts from
-    if save_dir is not None and (save_dir / "resume.pt").exists():
-        resume = torch.load(save_dir / "resume.pt", weights_only=True)
-        first, ema, pema, warm, prev_grads = resume["step"], resume["ema"], resume["pema"], resume["warm"], resume["prev_grads"]
-        logger.restore(torch.load(save_dir / "metrics.pt", weights_only=True))
-        saved = torch.load(save_dir / "checkpoints" / f"{first}.pt", weights_only=True)
-        init_state = replace(init_state, **{group: saved[group] for group in (*init_state.groups, *init_state.aux)})
-        if v is not None:
-            v = init_state.unflatten(resume["tangent"])
-        ema, pema, warm, prev_grads, v = (to_device(tensors, magic.device) for tensors in (ema, pema, warm, prev_grads, v))
-
-    create_graph = bool(ks) or curvature
-    try:
-        trace = magic.train.trace(init_state, n_steps=start + n_steps - first, start=first, log=logger, create_graph=create_graph, hook=hook)
-        for t, state, grads in trace:
-            with fwAD._set_fwd_grad_enabled(False):  # the logging computes no tangents (the state and grads are duals if `tangent`)
-                params = {k: p.detach() for k, p in state.params.items()}
-                if checkpoint_every and save_dir is not None and t > first and grads is not None and (t - start) % checkpoint_every == 0:
-                    (save_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-                    torch.save(asdict(state.apply(lambda s: fwAD.unpack_dual(s).primal.detach().cpu())), save_dir / "checkpoints" / f"{t}.pt")
-                    logger.finish(save_dir / "metrics.pt")
-                    resume = {"step": t, "ema": ema, "pema": pema, "warm": warm, "prev_grads": prev_grads, "tangent": None if v is None else list(v)}
-                    torch.save(to_device(resume, "cpu"), save_dir / "resume.pt")
-                X, Y, _ = magic.loader.get_batch(t)
-                if state.lr.kind != "constant" or state.lr.warmup:
-                    logger.log(t, lr=torch.tensor(state.lr(t)))
-                if grads is not None:
-                    if prev_grads is not None:
-                        grad_diff = {k: g.detach() - g_prev for k, (g, g_prev) in dict_zip(grads, prev_grads).items()}
-                        logger.log(t, grad_displacement=total_l2(grad_diff) / total_l2(prev_grads))
-                    prev_grads = {k: fwAD.unpack_dual(g).primal.detach() for k, g in grads.items()}
-
-                if ema_decay is not None:
-                    ema = params if ema is None else {k: e + (1 - ema_decay) * (p - e) for k, (e, p) in dict_zip(ema, params).items()}
-                if ema_gamma is not None:
-                    beta = (1 - 1 / (t + 1)) ** (ema_gamma + 1)  # the step t is the (t + 1)th state
-                    pema = params if pema is None else {k: e + (1 - beta) * (p - e) for k, (e, p) in dict_zip(pema, params).items()}
-                    with torch.no_grad():
-                        loss, out = magic.objective.forward(pema, X, Y)
-                        batch_metrics = {"loss": loss, **{k: m.mean() for k, m in metrics(out, Y).items()}}
-                        logger.log(t, **{f"{k}/ema": m for k, m in batch_metrics.items()})
-
-                if v is not None:
-                    logger.log_norms(t, "tangent", v)
-
-                if stored and t > start:  # the eigenpair step t - 1 computed at s_{t-1}
-                    assert isinstance(state, SecondOrderState)
-                    for sign, name in stored.items():
-                        log_eigs(t - 1, [sign], state.stats[name][None], {k: u[None] for k, u in state.eigvec.items()})
-                    log_threshold(t, state)
-                eig_step = grads is not None and (t - start) % eig_every == 0
-                if ks and eig_step and t > start:
-                    hvp_fn = hvp_from_grads(grads, state.params)
-                    for sign, k in ks.items():
-                        if sign not in warm:  # random start
-                            g = torch.Generator().manual_seed(t)
-                            warm[sign] = {name: torch.randn(k, *p.shape, generator=g, dtype=torch.float32).to(p.device, p.dtype) for name, p in params.items()}
-                        eigvals, warm[sign], n_iter = hessian_eigs(hvp_fn, warm[sign], None, sign)
-                        logger.log(t, **{f"lobpcg_iters/{sign}": torch.tensor(n_iter)})
-                        log_eigs(t, [sign * (i + 1) for i in range(k)], eigvals, warm[sign])
-                    if not stored:
-                        log_threshold(t, state)
-                if curvature and eig_step:
-                    assert grads is not None
-                    hvp_fn = hvp_from_grads(grads, state.params)
-                    directions = {"grad": {k: g.detach() for k, g in grads.items()},
-                                  "tangent": None if v is None else v.params,
-                                  "ema": None if ema is None or t == start else {k: p - e for k, (p, e) in dict_zip(params, ema).items()}}
-                    for name, d in directions.items():
-                        if d is not None:
-                            log_curvature(t, name, d, hvp_fn)
-                    if not ks and not stored:
-                        log_threshold(t, state)
-
-                if eval_every and ((t - start) % eval_every == 0 or grads is None):
-                    test_ds = test_loader.dataset
-                    indices = torch.arange(len(test_ds)) if n_test is None or grads is None else test_ds.subset(n_test, index=t)
-                    for p, suffix in ((params, ""), (pema, "/ema"), (ema, "/ema_short")):
-                        if p is not None:
-                            loss, mean_metrics = magic.objective.eval_loss(p, test_loader, indices)
-                            logger.log(t, **{f"test_{k}{suffix}": m for k, m in {"loss": loss, **mean_metrics}.items()})
-    finally:
-        if tangent and dual_level:  # (also on an error: a level left open breaks the next forward-mode run)
-            fwAD.exit_dual_level()
-    return state.apply(lambda s: s.detach().cpu())
-
-
-def backprop_logged(
-    magic: Magic, init_state: OptimState, d_state: OptimState, eval_sets: list[tuple[Tensor, Tensor]], logger: Logger, **kwargs
-) -> tuple[OptimState, Tensor]:
-    """`Magic.backprop` logging, per step and eval set i: "f/i" = f_i(s_t), the norms of df_i/ds_t ("d_state/i") and |df_i/dw_t| ("d_weights/i")"""
-    eval_sets = to_device([list(eval_set) for eval_set in eval_sets], magic.device)
-    trace = magic.backprop.trace(init_state, d_state, **kwargs)
-    while True:
-        try:
-            t, state, d_state_t, d_batch_weights = next(trace)
-        except StopIteration as stop:
-            return stop.value
-        params = {k: p.detach() for k, p in state.params.items()}
-        for i, (X_i, Y_i) in enumerate(eval_sets):
-            with torch.no_grad():
-                logger.log(t, **{f"f/{i}": magic.objective.forward(params, X_i, Y_i)[0], f"d_weights/{i}": d_batch_weights[i].norm()})
-            logger.log_norms(t, f"d_state/{i}", d_state_t.apply(lambda d: d[i]))
 
 
 def retrained_dirname(kind: str, alpha: float, index: int) -> str:
@@ -531,7 +320,7 @@ def new(exp_dir: Path, **kwargs):
     click.echo(f"saved {path}" + ("" if cfg.lr else " (no lr: run experiments/tune_lr.py)"))
 
 
-@main.command(help="Train the full model on all the data from step `start`, with the logs (see `train_logged`), into DIR/full_model: "
+@main.command(help="Train the full model on all the data from step `start`, with the logs (see `magic.TrainLog`), into DIR/full_model: "
               "final.pt, metrics.pt and plots. Skipped if final.pt exists, unless --force; a killed run continues from its last checkpoint (--checkpoint-every). By default only the logs that need no second "
               "derivative (and so allow --compile): the eigenvalues, curvature and tangent are opt-in.")
 @exp_dir
@@ -565,12 +354,13 @@ def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every
     if exp.cfg.optimizer == "centralflow":  # the flow does not oscillate: the EMAs (of the params, of the plotted metrics) only lag behind
         ema_gamma, ema_decay = 0, ema_decay if curvature else 0
     start, n_steps = exp.steps
-    final = train_logged(
-        exp.magic, exp.start_state, n_steps=n_steps, start=start, test_loader=exp.test_loader, logger=logger,
+    train_log = TrainLog(
+        magic=exp.magic, logger=logger, test_loader=exp.test_loader,
         n_top_eigs=num_top_eigs, n_neg_eigs=num_neg_eigs, eig_every=eig_every, curvature=curvature, tangent=tangent,
         eval_every=eval_every, n_test=n_test or None, ema_gamma=ema_gamma or None, ema_decay=ema_decay or None,
         checkpoint_every=checkpoint_every * exp.substeps, save_dir=full_dir,
     )
+    final = train_log.train(exp.start_state, n_steps=n_steps, start=start)
     full_dir.mkdir(parents=True, exist_ok=True)
     torch.save(asdict(final), full_dir / "final.pt")
     (full_dir / "resume.pt").unlink(missing_ok=True)

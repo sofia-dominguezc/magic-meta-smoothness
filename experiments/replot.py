@@ -1,6 +1,6 @@
 """
 Redraw <dir>/metrics.png (scalars) and <dir>/metrics_norms[_<group>].png (norms) from the saved <dir>/metrics.pt of DIR/full_model,
-DIR/magic and DIR/rayleigh, without retraining (e.g. after a change of Logger._plot_scalars / _plot_norms, or
+DIR/magic and DIR/rayleigh, without retraining (e.g. after a change of `logging.plot_metrics`, or
 to switch the scales):
   python -m experiments.replot all DIR [DIR ...] [--yscale log|linear]
   python -m experiments.replot zoom DIR --start S --n-steps N   # only the steps S to S + N (of the config: edge flow substeps
@@ -13,7 +13,6 @@ linear scale) with |1 - P eig| for the eigenvalues "eig/i" logged by `train` (P 
 """
 
 import re
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +20,7 @@ import click
 import torch
 
 from main import Experiment, load_renamed
-from src.logging import Logger
-
-
-NORM_LIKE = ("d_state", "tangent", "params", "grads", "eigvec", "displacement")  # scalar panels of total norms (`Logger(total_norms=True)`)
+from src.logging import grid, plot_metrics, split_panels
 
 
 def slice_steps(metrics: dict, steps: tuple[int, int]) -> dict:
@@ -39,10 +35,10 @@ def slice_steps(metrics: dict, steps: tuple[int, int]) -> dict:
 
 def replot(metrics_path: Path, name: str, yscale: str | None = None, eos: float | None = None, log_derivative: bool = False, eigs: dict | None = None,
            smooth: bool = True, split_norms: bool = False, step_scale: int = 1, steps: tuple[int, int] | None = None):
-    """`yscale`: forces "log" / "linear" on the norms, the norm-like scalars and "eig" (`Logger.yscale`; None: the defaults).
+    """`yscale`: forces "log" / "linear" on the norms, the norm-like scalars and "eig" (None: the defaults).
     `eos`: the stability threshold drawn in the "eig" panel (rayleigh: of the preconditioned Hessian). `eigs`: metrics with
     {"eig/i": {"step", "value"}} drawn as |1 - P eig| in the derivative plot, with P = eos / "eig/threshold" (default: those of
-    `metrics_path`; without "eig/threshold", |1 - eig|). `split_norms`, `step_scale`: see `Logger`. `steps`: only the logged
+    `metrics_path`; without "eig/threshold", |1 - eig|). `split_norms`, `step_scale`: see `plot_metrics`. `steps`: only the logged
     steps (unscaled) in this range, into <stem>_zoom_<start>_<end>*.png (the config's steps) instead of <stem>*.png"""
     metrics = load_renamed(metrics_path)
     all_eigs = metrics if eigs is None else eigs
@@ -52,22 +48,12 @@ def replot(metrics_path: Path, name: str, yscale: str | None = None, eos: float 
         name = f"{name}\nsteps {steps[0] // step_scale}-{steps[1] // step_scale}"
     eigs = {k: v for k, v in all_eigs.items() if re.fullmatch(r"eig/-?\d+", k)}
     threshold = all_eigs.get("eig/threshold")
-    panels: dict[str, list[str]] = defaultdict(list)
-    for k in metrics:
-        panels[k.rsplit("/", 1)[0] if "/" in k else k].append(k)
-    norms = {p: names for p, names in panels.items() if "." in names[0].rsplit("/", 1)[-1]}  # lines are tensor names
-    scalars = {p: names for p, names in panels.items() if p not in norms}
-    logger = Logger(name, smooth=smooth, step_scale=step_scale)
-    logger.yscale = yscale
-    logger.eos = eos if "eig/threshold" not in metrics else None  # `train` logs its threshold as a line
-    logger._norm_panels = {p for p in scalars if p.split("/")[0] in NORM_LIKE}  # (total norms: scalar panels in log scale)
-    if scalars:
-        logger._plot_scalars(metrics, scalars, metrics_path.with_suffix(".png"))
-    if norms:
-        logger._plot_norms(metrics, norms, metrics_path.with_name(f"{metrics_path.stem}_norms.png"), split=split_norms)
+    scalars, norms = split_panels(metrics)
+    plot_metrics(metrics, metrics_path, name, smooth=smooth, split_norms=split_norms, step_scale=step_scale, yscale=yscale,
+                 eos=eos if "eig/threshold" not in metrics else None)  # (`train` logs its threshold as a line)
     derivs = {p: names for p, names in norms.items() if p.startswith(("tangent", "d_state"))}  # directions propagated by the training
     if derivs and log_derivative:
-        fig, axes = logger._grid(len(derivs), ncols=2, size=(10, 6))
+        fig, axes = grid(name, len(derivs), ncols=2, size=(10, 6))
         for ax, (panel, names) in zip(axes, derivs.items()):
             steps = metrics[names[0]]["step"]
             assert all(torch.equal(metrics[k]["step"], steps) for k in names)

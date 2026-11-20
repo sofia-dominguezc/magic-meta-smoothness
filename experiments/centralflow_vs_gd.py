@@ -88,7 +88,7 @@ def centralflow_vs_gd(cf_dir: Path, gd_dir: Path, device: str = "cpu", n_test: i
                 proj = (U @ d).square().sum()
                 logger.log(K * t, **{"in_span/gd-cf": proj / d.square().sum(), "oscillation/gd": proj})
             for name, params in (("gd", w_params), ("cf", c_params)):
-                loss, metrics = cf.objective.eval_loss(params, cf.test_loader, test_idx)
+                loss, metrics = cf.objective.eval_loss(params, cf.test_loader.iter_batches(test_idx))
                 logger.log(K * t, **{f"test_loss/{name}": loss, f"test_acc/{name}": metrics["acc"]})
     out_dir = cf_dir / "vs_gd"
     out_dir.mkdir(exist_ok=True)

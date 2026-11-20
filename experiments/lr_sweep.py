@@ -104,7 +104,7 @@ def main(exp_dir: Path, lrs: str, steps: str | None, runs: tuple[Path, ...], poi
     title = f"{template.model} on {template.dataset}, {template.optimizer}, {steps_label}"
     norm_names = {"params", "grads"}
     names = [n for n in run_metrics[lr_list[0]] if all(n in m for m in run_metrics.values())
-             and n not in ("lr", "gpu_gb") and ("/ema" not in n or n.startswith(("test_loss/", "test_acc/")))]
+             and n not in ("lr", "gpu_gb", "gpu_util") and ("/ema" not in n or n.startswith(("test_loss/", "test_acc/")))]
     names.sort(key=lambda n: (n in norm_names, n.startswith("test_")))
     plot_runs(run_metrics, names, title, exp_dir / "lr_tuning_curves.png", log_names=norm_names)
     fig = plot_summary(lr_list, min_losses, max_accs, max_acc_steps, acc_models, None, [None] * len(lr_list), best, title, exp_dir / "lr_tuning.png")

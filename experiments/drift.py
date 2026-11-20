@@ -36,9 +36,8 @@ from torch import Tensor
 from main import Experiment
 from src.magic import Magic
 from src.logging import fig_title
-from src.optimizers import OptimState
+from src.optimizers import dict_zip, OptimState
 from src.second_order import SecondOrderState
-from src.utils import dict_zip
 
 
 def spec_norms(D: Tensor) -> Tensor:
