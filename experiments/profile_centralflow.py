@@ -38,7 +38,7 @@ from src.lobpcg import hessian_eigs
 from src.objective import hvp_from_forward, hvp_from_grads
 from src.magic import Magic
 from src.optimizers import LRSchedule
-from src.second_order import CentralFlowState, LossGraph
+from src.second_order import COMPILED, CentralFlowState, Loss, LossGraph, curvature_grad, curvature_grad_vjp
 
 GB = 2**30
 
@@ -161,17 +161,16 @@ def unit_costs(magic: Magic, X: Tensor, Y: Tensor, params: dict[str, Tensor], me
         attempt("curvature backward", lambda: torch.autograd.grad(list(H_u.values()), params, others, retain_graph=True, is_grads_batched=True), 3, n=n)
     del H_u
 
-    # the backward's curvatures: one pair with its third-derivative graph, then one backward through it per fn
-    graph = LossGraph(params, hvp_fn, inputs)
-    leaves = {k: v.requires_grad_() for k, v in random_vectors(params, 2, seed=3).items()}
-    u, v = ({k: leaf[i] for k, leaf in leaves.items()} for i in (0, 1))
-    attempt("pair, no graph", lambda: CentralFlowState._curvature(graph, u, v), 3)
-    pair = attempt("pair, create_graph", lambda: CentralFlowState._curvature(graph, u, v, create_graph=True))
-    if pair is not None:
-        cotangents = [torch.ones_like(pair[0]), *random_vectors(params, None, seed=4).values()]
-        attempt("pair backward", lambda: torch.autograd.grad(
-            [pair[0], *pair[1].values()], [*inputs, *leaves.values()], cotangents, retain_graph=True, materialize_grads=True), 3)
-    del pair
+    # a pair's curvature and its gradient by stateful autograd (STATEFUL), then by torch.func (the step, the eigenvector term) and its adjoint (the vjp)
+    u, v, d_curvature_grad = (random_vectors(params, None, seed=seed) for seed in (3, 5, 4))
+    attempt("pair, stateful", lambda: CentralFlowState._graph_curvature(LossGraph(params, hvp_fn), u, v), 3)
+    loss = Loss(partial(magic.objective.forward, X=X, Y=Y), {k: p.detach() for k, p in params.items()}, {"weights": weights.detach()})
+    pair_fn, vjp_fn = (COMPILED[fn] if compile else fn for fn in (curvature_grad, curvature_grad_vjp))
+    with torch.no_grad():
+        attempt("pair, func: first call", lambda: pair_fn(*loss, u, v))
+        attempt("pair, func", lambda: pair_fn(*loss, u, v), 3)
+        attempt("pair vjp, func: first call", lambda: vjp_fn(*loss, u, v, torch.ones((), device=X.device), d_curvature_grad))
+        attempt("pair vjp, func", lambda: vjp_fn(*loss, u, v, torch.ones((), device=X.device), d_curvature_grad), 3)
 
     # the eigenvector term: H U with its graph (batched over k), then one backward per fn
     for n in (1, 2):
@@ -237,8 +236,8 @@ class Phases:
         return {name: t - prev for (_, prev), (name, t) in zip(self.marks, self.marks[1:])}
 
     def patch(self, monkeypatch: dict):
-        """Mark the end of `_top_eigs` (lobpcg), `_loss_graphs`, the curvatures of the step, `_flow_update`, the first
-        pair of the vjp (the backward to the curvatures before it) and `minres` (its start too)"""
+        """Mark the end of `_top_eigs` (lobpcg), `_pair_fns` (loss graphs), the curvatures of the step, `_flow_update`, the
+        vjp's `_losses` (the backward to the curvatures before it) and `minres` (its start too: the pairs' adjoint before it)"""
         def after(name: str, fn, first_only: bool = False):
             def wrapper(*args, **kwargs):
                 result = fn(*args, **kwargs)
@@ -255,20 +254,20 @@ class Phases:
                 return result
             return wrapper
 
-        originals = {name: getattr(CentralFlowState, name) for name in ("_top_eigs", "_loss_graphs", "_pair_curvatures", "_flow_update", "_curvature")}
+        originals = {name: getattr(CentralFlowState, name) for name in ("_top_eigs", "_pair_fns", "_pair_curvatures", "_flow_update", "_losses")}
         monkeypatch["CentralFlowState"] = originals
         monkeypatch["minres"] = second_order.minres
         CentralFlowState._top_eigs = after("lobpcg", originals["_top_eigs"])
-        CentralFlowState._loss_graphs = after("loss graphs", originals["_loss_graphs"])
+        CentralFlowState._pair_fns = after("loss graphs", originals["_pair_fns"])
         CentralFlowState._pair_curvatures = after("curvatures", originals["_pair_curvatures"])
         CentralFlowState._flow_update = after("flow update", originals["_flow_update"])
-        CentralFlowState._curvature = staticmethod(after("to the curvatures", originals["_curvature"], first_only=True))
+        CentralFlowState._losses = after("to the curvatures", originals["_losses"], first_only=True)
         second_order.minres = before_and_after("minres", second_order.minres)
 
     @staticmethod
     def unpatch(monkeypatch: dict):
         for name, fn in monkeypatch["CentralFlowState"].items():
-            setattr(CentralFlowState, name, staticmethod(fn) if name == "_curvature" else fn)
+            setattr(CentralFlowState, name, fn)
         second_order.minres = monkeypatch["minres"]
 
 

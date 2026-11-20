@@ -125,6 +125,21 @@ def test_centralflow_helper_devices_match_one(float64):
             torch.testing.assert_close(getattr(one_device, name), getattr(helped, name), rtol=1e-10, atol=1e-12)
 
 
+def test_centralflow_stateful_step_matches_func(float64, monkeypatch):
+    """A central flow step with the third derivatives by stateful autograd gives the state of the torch.func one."""
+    magic, _, _, state = setup("centralflow")
+    X, Y, _ = magic.loader.get_batch(0)
+    sharpness = hessian_eigs(magic.objective.hvp_fn(state.params, X, Y), state.eigvecs, rtol=1e-8)[0][0]
+    state = replace(state, lr=LRSchedule(6 / sharpness.item())).apply(lambda p: p.detach().requires_grad_())
+    forward_fn = partial(magic.objective.forward, X=X, Y=Y)
+    func = state.step(0, forward_fn)[0]
+    monkeypatch.setattr(CentralFlowState, "STATEFUL", True)
+    stateful = state.step(0, forward_fn)[0]
+    assert int(func.stats["n_critical"]) >= 3
+    for name in ("params", "curvatures", "curvature_grads"):
+        torch.testing.assert_close(getattr(func, name), getattr(stateful, name), rtol=1e-10, atol=1e-12)
+
+
 @pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam"])
 def test_train_batched_matches_single(optimizer, float64):
     """Training R weightings at once (vmap) gives the same states as training them one by one."""

@@ -350,7 +350,7 @@ def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every
             (full_dir / name).unlink(missing_ok=True)
     if (full_dir / "resume.pt").exists():
         click.echo(f"continuing from the last checkpoint ({full_dir / 'resume.pt'})")
-    logger = Logger(exp.name, step_scale=exp.substeps, lags=(), smooth=exp.cfg.optimizer != "centralflow")
+    logger = Logger(exp.name, step_scale=exp.substeps, lags=(), smooth=exp.cfg.optimizer not in ["centralflow", "edgeflow"])
     if exp.cfg.optimizer == "centralflow":  # the flow does not oscillate: the EMAs (of the params, of the plotted metrics) only lag behind
         ema_gamma, ema_decay = 0, ema_decay if curvature else 0
     start, n_steps = exp.steps

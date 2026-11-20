@@ -33,9 +33,10 @@ from main import main as cli
 @click.option("--device", type=str, default="cpu", show_default=True)
 @click.option("--compile/--no-compile", default=False, help="torch.compile the plain training passes")
 @click.option("--vmap-limit", type=int, default=1, help="retrained models per vmapped pass (1: not vmapped, faster on small GPUs; 0: all of an alpha)")
+@click.option("--passes", type=int, default=2, help="replay retrainings")
 @click.option("--extra-step/--no-extra-step", default=False, help="evaluate also the reference of the models trained one more step")
 @click.option("--show/--no-show", default=True, help="show the final plots (every step's plots are saved in DIR)")
-def main(exp_dir, kind, alphas, n_train_subsets, n_eval_subsets, n_test, device, compile, vmap_limit, extra_step, show):
+def main(exp_dir, kind, alphas, n_train_subsets, n_eval_subsets, n_test, device, compile, vmap_limit, passes, extra_step, show):
     exp_dir = str(exp_dir)
     common = ["--device", device, "--compile" if compile else "--no-compile"]
     if json.loads((Path(exp_dir) / "config.json").read_text())["lr"] is None:
@@ -43,7 +44,7 @@ def main(exp_dir, kind, alphas, n_train_subsets, n_eval_subsets, n_test, device,
     alpha_args = [arg for alpha in alphas.split(",") for arg in ("--alpha", alpha)]
     cli(["train", exp_dir, "--no-show", *common], standalone_mode=False)
     cli(["retrain", exp_dir, "--kind", kind, *alpha_args, "--n-subsets", str(n_train_subsets), "--vmap-limit", str(vmap_limit or n_train_subsets), *common], standalone_mode=False)
-    cli(["magic", exp_dir, "--n-test", str(n_test), "--n-subsets", str(n_eval_subsets), "--no-show", *common], standalone_mode=False)
+    cli(["magic", exp_dir, "--n-test", str(n_test), "--n-subsets", str(n_eval_subsets), "--no-show", "--passes", passes, *common], standalone_mode=False)
     evaluate(Path(exp_dir), device, show, extra_step=extra_step)
 
 

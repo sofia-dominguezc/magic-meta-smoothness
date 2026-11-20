@@ -98,7 +98,8 @@ class Objective:
     ) -> tuple[Tensor, Tensor]:
         """The model on a batch: (mean loss, with the example `weights` [B] if given; outputs [B, C])"""
         losses, out = self.example_losses(params, X, Y)
-        return (losses if weights is None else weights * losses).mean(), out
+        # (a dot product: `(weights * losses).mean()` doesn't torch.compile under nested forward mode)
+        return losses.mean() if weights is None else torch.dot(weights, losses) / len(losses), out
 
     @torch.no_grad()
     def eval_loss(self, params: dict[str, Tensor], batches: Iterable[tuple[Tensor, Tensor]]) -> tuple[Tensor, dict[str, Tensor]]:

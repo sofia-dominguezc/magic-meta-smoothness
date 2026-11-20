@@ -1,0 +1,7 @@
+torch>=2.14
+torchvision>=0.29
+numpy>=2.5
+click>=8.5
+matplotlib>=3.11
+tqdm>=4.70
+pytest>=9.1
