@@ -5,7 +5,7 @@ import math
 import textwrap
 from collections import defaultdict
 from pathlib import Path
-from typing import Collection
+from typing import Collection, Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -54,7 +54,7 @@ def split_panels(metrics: dict) -> tuple[dict[str, list[str]], dict[str, list[st
 
 def plot_metrics(
     metrics: dict, path: Path, title: str, *, smooth: bool = True, split_norms: bool = False, step_scale: int = 1,
-    eos: float | None = None, yscale: str | None = None, log_panels: Collection[str] = (),
+    eos: float | None = None, yscale: str | None = None, log_panels: Collection[str] = (), seeds: bool = False,
 ):
     """Plot the metrics saved at `path` next to it, one panel per panel name ("panel" or "panel/line"), one line per line name:
     - <path>.png: the scalars. The line "ema" (the metric computed with an EMA of the params) is drawn dotted gray, unsmoothed;
@@ -65,13 +65,14 @@ def plot_metrics(
     - <path>_norms.png: the norms per tensor (the panels whose lines are tensor names), one line per tensor
       (`split_norms`: <path>_norms_<group>.png, one per OptimState group = last component of the panel names, the panels in a square)
     `smooth`: EMA-smooth the scalars in step time (when there are enough points); `step_scale`: the plots show step / step_scale
-    (edge / central flow: GD steps); `yscale`: forces this scale on the norms, the norm-like scalar panels and "eig"
+    (edge / central flow: GD steps); `yscale`: forces this scale on the norms, the norm-like scalar panels and "eig";
+    `seeds`: the vector values are seeds: the scalars as their mean with mean +- 2 std dashed, the norms as their mean
     """
     scalars, norms = split_panels(metrics)
     if scalars:
-        _plot_scalars(metrics, scalars, path.with_suffix(".png"), title, smooth, step_scale, eos, yscale, log_panels)
+        _plot_scalars(metrics, scalars, path.with_suffix(".png"), title, smooth, step_scale, eos, yscale, log_panels, seeds)
     if norms:
-        _plot_norms(metrics, norms, path.with_name(f"{path.stem}_norms.png"), title, split_norms, step_scale, yscale)
+        _plot_norms(metrics, norms, path.with_name(f"{path.stem}_norms.png"), title, split_norms, step_scale, yscale, seeds)
 
 
 def _panel_order(panel: str) -> int:
@@ -84,7 +85,7 @@ def _panel_order(panel: str) -> int:
 
 
 def _plot_scalars(metrics: dict, panels: dict[str, list[str]], out_path: Path, title: str, smooth: bool, step_scale: int,
-                  eos: float | None, yscale: str | None, log_panels: Collection[str]):
+                  eos: float | None, yscale: str | None, log_panels: Collection[str], seeds: bool):
     panels = dict(sorted(panels.items(), key=lambda item: _panel_order(item[0])))
     fig, axes = grid(title, len(panels), ncols=4, size=(4.5, 3.4))
     for ax, (panel, names) in zip(axes, panels.items()):
@@ -104,7 +105,16 @@ def _plot_scalars(metrics: dict, panels: dict[str, list[str]], out_path: Path, t
             else:
                 color, ls, i = f"C{i}", "-", i + 1
             style = f"o{ls}" if len(steps) == 1 or len(steps) > 1 and steps[1] - steps[0] > 1 else ls  # not per-step: show the points
-            if arr.ndim == 2:  # a vector per step: one line per entry
+            if arr.ndim == 2 and seeds:  # the mean of the seeds, +- 2 std dashed
+                mean, std = arr.mean(1), arr.std(1)
+                curves = [mean, mean - 2 * std, mean + 2 * std]
+                if smooth and len(steps) >= 20 and panel != "lr" and color != "0.45":
+                    ax.plot(steps, mean, style, alpha=0.3, lw=0.8, ms=2, color=color)
+                    curves = [ema_smooth(steps, curve) for curve in curves]
+                ax.plot(steps, curves[0], ls, lw=1.2, color=color, label=label)
+                for curve in curves[1:]:
+                    ax.plot(steps, curve, "--", lw=0.8, color=color, alpha=0.7)
+            elif arr.ndim == 2:  # a vector per step: one line per entry
                 for j in range(arr.shape[1]):
                     ax.plot(steps, arr[:, j], style, ms=3, lw=1, color=f"C{i}", label=f"{label} #{j}" if label else str(j))
                     i += 1
@@ -125,7 +135,8 @@ def _plot_scalars(metrics: dict, panels: dict[str, list[str]], out_path: Path, t
     fig.savefig(out_path, dpi=150)
 
 
-def _plot_norms(metrics: dict, panels: dict[str, list[str]], out_path: Path, title: str, split: bool, step_scale: int, yscale: str | None):
+def _plot_norms(metrics: dict, panels: dict[str, list[str]], out_path: Path, title: str, split: bool, step_scale: int, yscale: str | None,
+                seeds: bool = False):
     """Lines colored by layer (the tensor name without its last component) and styled by that component.
     `split`: one plot <out_path>_<group>.png per group = last component of the panel names, the panels in a square."""
     tensors = list(dict.fromkeys(n.rsplit("/", 1)[1] for names in panels.values() for n in names))
@@ -146,7 +157,8 @@ def _plot_norms(metrics: dict, panels: dict[str, list[str]], out_path: Path, tit
                 tensor = name.rsplit("/", 1)[1]
                 layer, _, kind = tensor.rpartition(".")
                 steps = metrics[name]["step"].numpy() / step_scale
-                ax.plot(steps, metrics[name]["value"].numpy(), styles.get(kind, ":"), marker="o" if len(steps) == 1 else None,
+                values = metrics[name]["value"].numpy()
+                ax.plot(steps, values.mean(1) if seeds and values.ndim == 2 else values, styles.get(kind, ":"), marker="o" if len(steps) == 1 else None,
                         lw=1, color=colors[layer or kind], label=tensor)
             ax.set(title=panel, xlabel="step", yscale=yscale or "log")
             ax.title.set_fontsize(9)
@@ -166,9 +178,9 @@ def scaled_l2(t: Tensor) -> Tensor:
     return t.norm() * (m**0.5 + n**0.5) / (m * n) ** 0.5
 
 
-def total_l2(tensors) -> Tensor:
-    """The L2 norm of a dict of tensors as one vector"""
-    return torch.stack([t.detach().pow(2).sum() for t in tensors.values()]).sum().sqrt()
+def total_l2(tensors: Iterable[Tensor], batch_dims: int = 0) -> Tensor:
+    """The L2 norm of `tensors` as one vector, over all but their first `batch_dims` dims (1, or a bool `batched`: [R] the norm of each of R models), in float64"""
+    return torch.stack([t.detach().double().flatten(int(batch_dims)).pow(2).sum(-1) for t in tensors]).sum(0).sqrt()
 
 
 class Logger:
@@ -203,19 +215,21 @@ class Logger:
             self._buf[k].append((step, v.detach()))
         self._maybe_flush()
 
-    def log_norms(self, step: int, name: str, tensors):
+    def log_norms(self, step: int, name: str, tensors, batched: bool = False):
         """Log the `scaled_l2` norm of each tensor of a dict {tensor name: tensor} as "name/<tensor name>",
-        or of an OptimState as "name/<group>/<tensor name>"."""
+        or of an OptimState as "name/<group>/<tensor name>". `batched`: tensors [R, *shape] of R models, a norm [R] each"""
+        assert not (batched and self.lags), "no displacements of batched tensors"
+        norm = torch.func.vmap(scaled_l2) if batched else scaled_l2
         groups = {"": tensors} if isinstance(tensors, dict) else {g: getattr(tensors, g) for g in tensors.groups}
         for group, group_tensors in groups.items():
             panel = f"{name}/{group}" if group else name
             prefix, _, index = name.rpartition("/")
             key = f"{prefix}/{group}/{index}" if group and prefix else panel  # the quantities "<prefix>/<i>" share a panel
             if self.total_norms:
-                self._buf[key].append((step, total_l2(group_tensors)))
+                self._buf[key].append((step, total_l2(group_tensors.values(), batched)))
             else:
                 for k, t in group_tensors.items():
-                    self._buf[f"{panel}/{k}"].append((step, scaled_l2(t)))
+                    self._buf[f"{panel}/{k}"].append((step, norm(t)))
             if self.lags:
                 self._log_displacement(step, key, group_tensors)
         self._maybe_flush()

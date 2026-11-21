@@ -47,7 +47,7 @@ def norm(x: Tensor, dims: int | tuple[int, ...], eps: float = 1e-5) -> Tensor:
 
 
 class MLP(nn.Module):
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 512, depth: int = 2):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 256, depth: int = 2):
         super().__init__()
         dims = [math.prod(in_shape)] + [width] * depth
         self.hidden = nn.ModuleList(Linear(a, b) for a, b in zip(dims, dims[1:]))
@@ -58,6 +58,24 @@ class MLP(nn.Module):
         for layer in self.hidden:
             x = F.gelu(layer(x))
         return self.out(x)
+
+
+class SimpleCNN(nn.Module):
+    """The CNN of Cohen et al. 2024 ("central flows"): two 3x3 convs of `width` and 2 * width channels, each followed by GeLU and
+    2x2 average pooling, a hidden linear layer of 4 * width and a linear readout."""
+
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 32):
+        super().__init__()
+        C, H, W = in_shape
+        self.conv1 = Conv2d(C, width, 3, padding=1)
+        self.conv2 = Conv2d(width, 2 * width, 3, padding=1)
+        self.hidden = Linear(2 * width * (H // 4) * (W // 4), 4 * width)
+        self.out = Linear(4 * width, out_dim, readout=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = F.avg_pool2d(F.gelu(self.conv1(x)), 2)
+        x = F.avg_pool2d(F.gelu(self.conv2(x)), 2)
+        return self.out(F.gelu(self.hidden(x.flatten(1))))
 
 
 class Block(nn.Module):
@@ -77,9 +95,10 @@ class Block(nn.Module):
 
 class ResNet(nn.Module):
     """Pre-activation ResNet for small images: a 3x3 stem, 3 stages of `blocks` residual blocks with
-    width, 2 * width, 4 * width channels (strides 1, 2, 2), global average pooling and a linear readout."""
+    width, 2 * width, 4 * width channels (strides 1, 2, 2), global average pooling and a linear readout
+    (the defaults: ResNet-20's 16 / 32 / 64 channels, 3 blocks per stage)."""
 
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 32, blocks: int = 1):
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 16, blocks: int = 3):
         super().__init__()
         self.stem = Conv2d(in_shape[0], width, 3, padding=1)
         self.blocks = nn.ModuleList()
@@ -114,16 +133,26 @@ class TransformerBlock(nn.Module):
         return x + self.fc2(F.gelu(self.fc1(norm(x, -1))))
 
 
-class ViT(nn.Module):
-    """Pre-norm ViT with `patch` x `patch` patches, learned positional embeddings (a bias-like raw tensor:
-    N(0, 1/width), used as sqrt(width) * pos), heads of `head_dim` dims, mean pooling and a linear readout."""
+def sincos_2d(height: int, width: int, dim: int, temperature: float = 10000.0) -> Tensor:
+    """Fixed 2-D sin-cos positional embeddings [height * width, dim]: (sin, cos) of y and of x at dim / 4 frequencies each"""
+    assert dim % 4 == 0, f"dim {dim} not a multiple of 4"
+    y, x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+    omega = 1 / temperature ** (torch.arange(dim // 4) / (dim // 4 - 1))
+    y, x = y.flatten()[:, None] * omega, x.flatten()[:, None] * omega
+    return torch.cat([y.sin(), y.cos(), x.sin(), x.cos()], 1)
 
-    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 96, depth: int = 3, head_dim: int = 32, patch: int = 4):
+
+class ViT(nn.Module):
+    """Pre-norm ViT with `patch` x `patch` patches, fixed 2-D sin-cos positional embeddings, heads of `head_dim` dims,
+    mean pooling and a linear readout (the defaults: SimpleViT's 64 dims, 3 blocks of 8 heads, patches of 4)."""
+
+    def __init__(self, in_shape: tuple[int, ...], out_dim: int, width: int = 64, depth: int = 3, head_dim: int = 8, patch: int = 4):
         super().__init__()
         C, H, W = in_shape
         self.patch = patch
         self.embed = Linear(C * patch * patch, width)
-        self.pos = nn.Parameter(torch.randn((H // patch) * (W // patch), width) / width**0.5)
+        self.pos: Tensor
+        self.register_buffer("pos", sincos_2d(H // patch, W // patch, width), persistent=False)
         self.blocks = nn.ModuleList(TransformerBlock(width, width // head_dim) for _ in range(depth))
         self.out = Linear(width, out_dim, readout=True)
 
@@ -131,10 +160,10 @@ class ViT(nn.Module):
         B, C, H, W = x.shape
         p = self.patch
         x = x.view(B, C, H // p, p, W // p, p).permute(0, 2, 4, 1, 3, 5).reshape(B, -1, C * p * p)
-        x = self.embed(x) + self.pos.shape[1] ** 0.5 * self.pos
+        x = self.embed(x) + self.pos
         for block in self.blocks:
             x = block(x)
         return self.out(norm(x, -1).mean(1))
 
 
-MODELS: dict[str, type[nn.Module]] = {"mlp": MLP, "cnn": ResNet, "vit": ViT}
+MODELS: dict[str, type[nn.Module]] = {"mlp": MLP, "simple_cnn": SimpleCNN, "cnn": ResNet, "vit": ViT}

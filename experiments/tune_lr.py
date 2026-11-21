@@ -32,9 +32,9 @@ Metrics = dict[str, dict[str, Tensor]]  # Logger.metrics()
 
 
 def plot_runs(runs: dict[float, Metrics], names: list[str], title: str, path: Path, log_names: Collection[str] = (), smooth: bool = True,
-              flow_time: bool = False):
+              flow_time: bool = False, log_time: bool = False, xlabel: str = "step"):
     """One panel per metric name, one line per lr (viridis, light to dark = small to large lr); `log_names`: log-scale panels;
-    `flow_time`: against the gradient flow time lr * step instead of the step"""
+    `flow_time`: against the gradient flow time lr * step instead of the step; `log_time`: log-scale time axis (step 0 not drawn)"""
     if not names:
         return
     lrs = list(runs)
@@ -51,6 +51,8 @@ def plot_runs(runs: dict[float, Metrics], names: list[str], title: str, path: Pa
             steps, arr = metrics[name]["step"].numpy(), metrics[name]["value"].numpy()
             order = np.argsort(steps, kind="stable")  # (MAGIC logs the steps in reverse)
             steps, arr = steps[order], arr[order]
+            if log_time:
+                steps, arr = steps[steps > 0], arr[steps > 0]
             per_step = len(steps) > 1 and steps[1] - steps[0] == 1
             time = steps * lr if flow_time else steps
             if smooth and per_step and len(steps) >= 20 and name not in log_names:
@@ -58,7 +60,7 @@ def plot_runs(runs: dict[float, Metrics], names: list[str], title: str, path: Pa
                 ax.plot(time, ema_smooth(steps, arr), "-", lw=1.2, color=colors[lr], label=f"{lr:g}")
             else:
                 ax.plot(time, arr, "-" if per_step else "o-", ms=3, lw=1, color=colors[lr], label=f"{lr:g}")
-        ax.set(title=name, xlabel="lr * step" if flow_time else "step", yscale="log" if name in log_names else "linear")
+        ax.set(title=name, xlabel="lr * step" if flow_time else xlabel, xscale="log" if log_time else "linear", yscale="log" if name in log_names else "linear")
         ax.title.set_fontsize(9)
     handles, labels = axes.flat[0].get_legend_handles_labels()
     fig.legend(handles, labels, title="lr", loc="outside right center", fontsize=7, title_fontsize=8, frameon=False)
@@ -67,8 +69,8 @@ def plot_runs(runs: dict[float, Metrics], names: list[str], title: str, path: Pa
 
 
 def d_state_totals(metrics: Metrics) -> tuple[Tensor, Tensor]:
-    """|df/ds_t| over all the state groups at each logged step t, in order: (steps [n], sqrt(sum of the squared
-    "d_state/<group>/0" norms) [n])"""
+    """|df/ds_t| at each logged step t, in order: (steps [n], "d_state/0" [n]; runs before 2026-11-21 logged it per state group,
+    "d_state/<group>/0": the sqrt of the sum of their squares)"""
     groups = [m for name, m in metrics.items() if name.startswith("d_state/") and name.endswith("/0")]
     order = groups[0]["step"].argsort()
     return groups[0]["step"][order], torch.stack([m["value"][order] for m in groups]).pow(2).sum(0).sqrt()
@@ -122,7 +124,7 @@ def tune_lr(
             max_acc_steps[suffix].append(int(accs["step"][accs["value"].argmax()]))
             msg += f" {label} {max_accs[suffix][-1]:.3f} (step {max_acc_steps[suffix][-1]})"
         if magic:
-            logger = Logger(f"MAGIC lr {lr:g}", smooth=False, total_norms=True, step_scale=exp.substeps)
+            logger = Logger(f"MAGIC lr {lr:g}", smooth=False, step_scale=exp.substeps)
             eval_set = exp.test_ds.examples(exp.test_ds.subset(n_test, index=0))
             d_state = final.cotangent(exp.objective.eval_grads(to_device(final.params, device), [eval_set])[1])
             backprop_logged(exp.magic, init_state, d_state, [eval_set], logger, n_steps=steps)

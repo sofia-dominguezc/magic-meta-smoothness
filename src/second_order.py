@@ -61,6 +61,11 @@ def curvature_grad_vjp(
     return grad(cotangent_product, argnums=(0, 1, 2, 3))(params, inputs, u, v)
 
 
+def standard(tensor: Tensor, device: torch.device | str | None = None) -> Tensor:
+    """A copy on `device` that is no view and has the default strides (torch.compile recompiles for other strides, of the view's base too)"""
+    return tensor.to(device).clone(memory_format=torch.contiguous_format)
+
+
 COMPILED = {fn: torch.compile(fn) for fn in (curvature_grad, curvature_grad_vjp)}  # (module-level: one cache for every step)
 PairFn = Callable[[dict[str, Tensor], dict[str, Tensor]], tuple[Tensor, dict[str, Tensor]]]  # (u, v) -> (u^T H v, its gradient to the params)
 
@@ -309,7 +314,7 @@ class CentralFlowState(SecondOrderState):
         for d, items in cls._dealt(len(chunks), len(hvp_fns)):
             device, hvp_fn = hvp_fns[d]
             for c in items:
-                results[c] = hvp_fn({k: v.to(device) for k, v in chunks[c].items()})
+                results[c] = hvp_fn({k: standard(v, device) for k, v in chunks[c].items()})
         return {k: torch.cat([results[c][k].to(v.device) for c in range(len(chunks))]) for k, v in V.items()}
 
     # The forward step
@@ -366,7 +371,7 @@ class CentralFlowState(SecondOrderState):
             U = {name: u.to(device) for name, u in critical.items()}
             for n in items:
                 i, j = int(rows[n]), int(cols[n])
-                results[n] = pair_fn({name: u[i] for name, u in U.items()}, {name: u[j] for name, u in U.items()})
+                results[n] = pair_fn({name: standard(u[i]) for name, u in U.items()}, {name: standard(u[j]) for name, u in U.items()})
         device = pair_fns[0][0]
         curvatures = [results[n][0].to(device) for n in range(len(rows))]
         curvature_grads = {name: [results[n][1][name].to(device) for n in range(len(rows))] for name in critical}
@@ -431,7 +436,8 @@ class CentralFlowState(SecondOrderState):
         self, losses: Sequence[Loss], critical: dict[str, Tensor],
         d_curvatures: Tensor, d_curvature_grads: dict[str, Tensor],
     ) -> tuple[list[Tensor], dict[str, Tensor]]:
-        """Adjoint of `_pair_curvatures`, returns `d (params, inputs)` and `d critical eigenvectors`: one pair and fn at a time"""
+        """Adjoint of `_pair_curvatures`, returns `d (params, inputs)` and
+        `d critical eigenvectors`: one pair and fn at a time"""
         n_fns, k = d_curvatures.shape[:2]
         rows, cols = torch.triu_indices(k, k)
         vjp_fn = COMPILED[curvature_grad_vjp] if self.compile else curvature_grad_vjp
@@ -443,16 +449,28 @@ class CentralFlowState(SecondOrderState):
         for d, items in self._dealt(len(rows), len(losses)):
             loss = losses[d]
             U = {name: u.to(loss.device) for name, u in critical.items()}
-            d_inputs = [torch.zeros(n_fns, *x.shape, dtype=x.dtype, device=loss.device) for x in (*loss.params.values(), *loss.inputs.values())]
-            d_critical = [torch.zeros(n_fns, *u.shape, dtype=u.dtype, device=loss.device) for u in U.values()]
+            d_inputs = [
+                torch.zeros(n_fns, *x.shape, dtype=x.dtype, device=loss.device)
+                for x in (*loss.params.values(), *loss.inputs.values())
+            ]
+            d_critical = [
+                torch.zeros(n_fns, *u.shape, dtype=u.dtype, device=loss.device)
+                for u in U.values()
+            ]
             for n in items:
                 i, j = int(rows[n]), int(cols[n])
                 d_curvature = symmetrize(d_curvatures, i, j).to(loss.device)
-                d_curvature_grad = {name: symmetrize(d_C_grad, i, j).to(loss.device) for name, d_C_grad in d_curvature_grads.items()}
+                d_curvature_grad = {
+                    name: symmetrize(d_C_grad, i, j).to(loss.device)
+                    for name, d_C_grad in d_curvature_grads.items()
+                }
                 for fn in range(n_fns):
                     d_params, d_loss_inputs, d_u, d_v = vjp_fn(
-                        *loss, {name: u[i] for name, u in U.items()}, {name: u[j] for name, u in U.items()},
-                        d_curvature[fn], {name: d_C_grad[fn] for name, d_C_grad in d_curvature_grad.items()},
+                        *loss,
+                        {name: standard(u[i]) for name, u in U.items()},
+                        {name: standard(u[j]) for name, u in U.items()},
+                        standard(d_curvature[fn]),
+                        {name: standard(d_C_grad[fn]) for name, d_C_grad in d_curvature_grad.items()},
                     )
                     for total, d_pair in zip(d_inputs, (*d_params.values(), *d_loss_inputs.values())):
                         total[fn] += d_pair
@@ -473,7 +491,7 @@ class CentralFlowState(SecondOrderState):
         """Adjoint of `_top_eigs` by implicit differentiation, returns `d (params, inputs)`:
             HU = lam U  ->  (lam - H) dU = dH U
             ->  v^T dU/dx = [(lam - H)^-1 v] dH U
-        The IVHP is MINRES + projection, then `sum_i d(z_i^T H u_i)` (`curvature_grad`, one eigenvector and fn at a time)"""
+        The IVHP is MINRES + projection, then `sum_i d(z_i^T H u_i)`"""
         shapes = {name: p.shape for name, p in self.params.items()}
         n_fns, k = next(iter(d_critical.values())).shape[:2]
         U = flatten(critical)  # [#params, k]
@@ -486,11 +504,16 @@ class CentralFlowState(SecondOrderState):
             for name, (p, z) in dict_zip(self.params, unflatten(Z, shapes)).items()
         }
         grad_fn = COMPILED[curvature_grad] if self.compile else curvature_grad
-        d_inputs = [torch.zeros(n_fns, *x.shape, dtype=x.dtype, device=x.device) for x in (*loss.params.values(), *loss.inputs.values())]
+        d_inputs = [
+            torch.zeros(n_fns, *x.shape, dtype=x.dtype, device=x.device)
+            for x in (*loss.params.values(), *loss.inputs.values())
+        ]
         for fn in range(n_fns):
             for i in range(k):
                 (d_params, d_loss_inputs), _ = grad_fn(
-                    *loss, {name: z[fn, i] for name, z in Z.items()}, {name: u[i] for name, u in critical.items()}
+                    *loss,
+                    {name: standard(z[fn, i]) for name, z in Z.items()},
+                    {name: standard(u[i]) for name, u in critical.items()},
                 )
                 for total, d_pair in zip(d_inputs, (*d_params.values(), *d_loss_inputs.values())):
                     total[fn] += d_pair

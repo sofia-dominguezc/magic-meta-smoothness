@@ -62,8 +62,8 @@ def test_cli_end_to_end(tmp_path):
     assert len(logged["test_loss"]["step"]) == 4 and logged["eig/-1"]["step"].tolist() == [2, 4, 6, 8, 10]  # steps 0, 4, 8, 12; LOBPCG after start
     torch.testing.assert_close(logged["eig/threshold"]["value"], torch.full((5,), 2 * 1.9 / json.loads((tmp_path / "config.json").read_text())["lr"], dtype=torch.float64))  # momentum 0.9: 2 (1 + 0.9) / lr
     magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)  # of the last magic call that computed something
-    assert "d_state/0/buffer/out.weight" in magic_metrics and len(magic_metrics) == 2 * 6 + 1 + 2 + 1  # 1 subset: (params, buffer) x 6 tensors + d_weights + 2 displacements + f
-    assert len(magic_metrics["displacement/d_state/params/0"]["step"]) == 11 and len(magic_metrics["f/0"]["step"]) == 12  # 12 logged deltas (one per step)
+    assert set(magic_metrics) == {"f/0", "d_state/0", "d_weights/0"}  # 1 subset: scalars only
+    assert all(len(m["step"]) == 12 and m["value"].ndim == 1 for m in magic_metrics.values())  # (one per step)
     assert not (tmp_path / "retrained" / results["groups"][0]["runs"][0] / "metrics.pt").exists()  # retrained runs aren't logged
     for g in results["groups"]:
         assert g["pooled"]["ccc"] > 0.9 and g["pooled"]["spearman"] > 0.9
@@ -127,7 +127,7 @@ def test_sharpness(tmp_path):
     torch.testing.assert_close(logged["eig/1"]["value"], logged["sharpness"]["value"])  # the step's own top eigenvalue, unscaled
     torch.testing.assert_close(logged["eig/threshold"]["value"], logged["sharpness"]["value"])  # lr 1: 2 / (2 / sharpness)
     magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)
-    assert not any(k.startswith("d_state/5 examples #0/eigvec") for k in magic_metrics)  # no norms of the aux groups
+    assert set(magic_metrics) == {"f/0", "d_state/0", "d_weights/0"}
 
 
 def test_bf16(tmp_path):
@@ -201,7 +201,7 @@ def test_newton(tmp_path):
     torch.testing.assert_close(logged["eig/-1"]["value"], logged["min_eig"]["value"])  # unscaled
     torch.testing.assert_close(logged["eig/threshold"]["value"], 2 * ((-2 * logged["min_eig"]["value"]).clamp_min(0) + 0.1))  # 2 / (lr / shift), lr 1, damping 0.1
     magic_metrics = torch.load(tmp_path / "magic" / "metrics.pt", weights_only=True)
-    assert not any(k.startswith("d_state/5 examples #0/newton") for k in magic_metrics)  # no norms of the aux groups
+    assert set(magic_metrics) == {"f/0", "d_state/0", "d_weights/0"}
 
 
 def test_prune(tmp_path):
@@ -280,7 +280,7 @@ def test_checkpoints_and_resume(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="killed"):
         runner.invoke(main, magic_args, catch_exceptions=False)
     assert torch.load(killed / "magic" / "resume.pt", weights_only=True)["step"] == 3
-    assert (killed / "magic" / "metrics.pt").exists() and (killed / "magic" / "metrics_norms_params.png").exists()
+    assert (killed / "magic" / "metrics.pt").exists() and (killed / "magic" / "metrics.png").exists()
     monkeypatch.setattr(Loader, "get_batch", get_batch)
     result = runner.invoke(main, magic_args, catch_exceptions=False)
     assert result.exit_code == 0 and "continuing from step 3" in result.output, result.output
@@ -291,3 +291,61 @@ def test_checkpoints_and_resume(tmp_path, monkeypatch):
     logged, ref = (torch.load(d / "magic" / "metrics.pt", weights_only=True) for d in (killed, plain))
     assert logged["f/0"]["step"].tolist() == ref["f/0"]["step"].tolist() == list(range(7, -1, -1))
     torch.testing.assert_close(logged["d_weights/1"]["value"], ref["d_weights/1"]["value"])
+
+
+def test_seeds(tmp_path):
+    """n_seeds 2 trains the models of init seeds 3 and 4 vmapped: each seed's logs, final state and MAGIC df/dw are those of its own single run"""
+    runner = CliRunner()
+    config = ["--dataset", "majority", "--model", "mlp", "--width", "16", "--n-steps", "6", "--lr", "0.1", "--dtype", "fp64"]
+    for name, seeds in (("both", ["--init-seed", "3", "--n-seeds", "2"]), ("seed3", ["--init-seed", "3"]), ("seed4", ["--init-seed", "4"])):
+        for args in (["new", str(tmp_path / name), *config, *seeds], ["train", str(tmp_path / name), "--eval-every", "2", "--n-test", "0", "--no-show"]):
+            result = runner.invoke(main, args, catch_exceptions=False)
+            assert result.exit_code == 0, result.output
+    both = torch.load(tmp_path / "both" / "full_model" / "metrics.pt", weights_only=True)
+    final = torch.load(tmp_path / "both" / "full_model" / "final.pt", weights_only=True)
+    for r, name in enumerate(("seed3", "seed4")):
+        single = torch.load(tmp_path / name / "full_model" / "metrics.pt", weights_only=True)
+        assert set(single) == set(both)
+        for k in single:
+            torch.testing.assert_close(both[k]["value"][:, r], single[k]["value"], msg=k)
+        single_final = torch.load(tmp_path / name / "full_model" / "final.pt", weights_only=True)
+        for k, p in single_final["params"].items():
+            torch.testing.assert_close(final["params"][k][r], p)
+    for name in ("both", "seed3", "seed4"):
+        result = runner.invoke(main, ["magic", str(tmp_path / name), "--n-test", "3", "--no-show"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+    both_lin = torch.load(tmp_path / "both" / "magic" / "3_examples_0" / "linearization.pt", weights_only=True)
+    for r, name in enumerate(("seed3", "seed4")):
+        single_lin = torch.load(tmp_path / name / "magic" / "3_examples_0" / "linearization.pt", weights_only=True)
+        torch.testing.assert_close(both_lin["output"][r], single_lin["output"])
+        torch.testing.assert_close(both_lin["d_weights"][r], single_lin["d_weights"])
+    with pytest.raises(click.UsageError):
+        main.main(["retrain", str(tmp_path / "both")], standalone_mode=False)
+
+
+def test_extend(tmp_path):
+    """A 2-seed run of 6 steps extended to 10 (--extend-to, twice: the second is a no-op) logs what a 10-step run does, but the
+    EMA of the params, restarted at step 6, and grad_displacement at step 6 (no previous gradients)"""
+    runner = CliRunner()
+    config = ["--dataset", "majority", "--model", "mlp", "--width", "16", "--lr", "0.1", "--dtype", "fp64", "--n-seeds", "2"]
+    train = ["--eval-every", "2", "--n-test", "0", "--ema-gamma", "0", "--checkpoint-every", "4", "--no-show"]
+    for args in (["new", str(tmp_path / "ext"), *config, "--n-steps", "6"], ["train", str(tmp_path / "ext"), *train],
+                 ["train", str(tmp_path / "ext"), *train, "--extend-to", "10"], ["train", str(tmp_path / "ext"), *train, "--extend-to", "10"],
+                 ["new", str(tmp_path / "ref"), *config, "--n-steps", "10"], ["train", str(tmp_path / "ref"), *train]):
+        result = runner.invoke(main, args, catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+    assert json.loads((tmp_path / "ext" / "config.json").read_text())["n_steps"] == 10
+    ext, ref = (torch.load(tmp_path / name / "full_model" / "metrics.pt", weights_only=True) for name in ("ext", "ref"))
+    assert set(ext) == set(ref)
+    ref["grad_displacement"] = {name: v[ref["grad_displacement"]["step"] != 6] for name, v in ref["grad_displacement"].items()}
+    for k in ref:
+        assert ext[k]["step"].tolist() == ref[k]["step"].tolist(), k
+        if k.endswith("/ema_short"):  # the same until the restart
+            torch.testing.assert_close(ext[k]["value"][ext[k]["step"] < 6], ref[k]["value"][ref[k]["step"] < 6])
+        else:
+            torch.testing.assert_close(ext[k]["value"], ref[k]["value"], msg=k)
+    for name in ("ext", "ref"):
+        assert not (tmp_path / name / "full_model" / "resume.pt").exists()
+    final_ext, final_ref = (torch.load(tmp_path / name / "full_model" / "final.pt", weights_only=True) for name in ("ext", "ref"))
+    for k, p in final_ref["params"].items():
+        torch.testing.assert_close(final_ext["params"][k], p)

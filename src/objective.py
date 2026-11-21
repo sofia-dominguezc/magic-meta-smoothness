@@ -86,6 +86,11 @@ class Objective:
     loss_fn: LossFn
     bf16: bool = False
 
+    def model_dims(self, params: dict[str, Tensor]) -> tuple[int, ...]:
+        """The dims of `params` before the model's: (R,) for the params [R, *shape] of R models, () for one model's"""
+        name, p = next(iter(params.items()))
+        return tuple(p.shape[: p.ndim - self.model.get_parameter(name).ndim])
+
     def example_losses(self, params: dict[str, Tensor], X: Tensor, Y: Tensor) -> tuple[Tensor, Tensor]:
         """The model on a batch: (per-example losses [B], outputs [B, C])"""
         with torch.autocast(X.device.type, torch.bfloat16, enabled=self.bf16):
@@ -102,14 +107,19 @@ class Objective:
         return losses.mean() if weights is None else torch.dot(weights, losses) / len(losses), out
 
     @torch.no_grad()
-    def eval_loss(self, params: dict[str, Tensor], batches: Iterable[tuple[Tensor, Tensor]]) -> tuple[Tensor, dict[str, Tensor]]:
-        """Mean loss and metrics of `params` over the examples of `batches` (X, Y)"""
+    def eval_loss(
+        self, params: dict[str, Tensor], batches: Iterable[tuple[Tensor, Tensor]], batched: bool = False
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Mean loss and metrics of `params` over the examples of `batches` (X, Y)
+        `batched`: params [R, *shape] of R models, vmapped: [R] each)"""
+        example_losses = vmap(self.example_losses, in_dims=(0, None, None)) if batched else self.example_losses
+        example_metrics = vmap(metrics, in_dims=(0, None)) if batched else metrics
         n_examples = 0
         sums: dict[str, Tensor] = {}
         for X, Y in batches:
-            losses, out = self.example_losses(params, X, Y)
-            for k, v in {"loss": losses, **metrics(out, Y)}.items():
-                sums[k] = sums.get(k, 0) + v.sum()
+            losses, out = example_losses(params, X, Y)
+            for k, v in {"loss": losses, **example_metrics(out, Y)}.items():
+                sums[k] = sums.get(k, 0) + v.sum(-1)
             n_examples += len(X)
         means = {k: total / n_examples for k, total in sums.items()}
         return means.pop("loss"), means
@@ -121,11 +131,15 @@ class Objective:
         return hvp_from_grads(grads, params)
 
     def eval_grads(self, params: dict[str, Tensor], eval_sets: Sequence[tuple[Tensor, Tensor]]) -> tuple[Tensor, dict[str, Tensor]]:
-        """(f [#fns], df/d(params) {name: [#fns, *shape]}): f_i = mean loss on the examples (X_i, Y_i) of `eval_sets`, in one forward"""
+        """(f [#fns], df/d(params) {name: [#fns, *shape]}): f_i = mean loss on the examples (X_i, Y_i) of `eval_sets`, in one forward
+        (params [R, *shape] of R models, vmapped: f [#fns, R], grads [#fns, R, *shape])"""
         params = {k: p.detach().requires_grad_() for k, p in params.items()}
+        models = self.model_dims(params)
+        example_losses = vmap(self.example_losses, in_dims=(0, None, None)) if models else self.example_losses
         device = next(iter(params.values())).device
         X, Y = (torch.cat(tensors).to(device) for tensors in zip(*eval_sets))
-        losses = self.example_losses(params, X, Y)[0]
+        losses = example_losses(params, X, Y)[0]  # [(R,) #examples]
         means = torch.block_diag(*[losses.new_full((1, len(X_i)), 1 / len(X_i)) for X_i, _ in eval_sets])  # [#fns, #examples]
-        grads = torch.autograd.grad(losses, params, means, is_grads_batched=True)
-        return means @ losses.detach(), grads
+        cotangents = means[:, None].expand(-1, *models, -1) if models else means
+        grads = torch.autograd.grad(losses, params, cotangents, is_grads_batched=True)
+        return torch.einsum("fe,...e->f...", means, losses.detach()), grads

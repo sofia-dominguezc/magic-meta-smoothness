@@ -46,7 +46,7 @@ from src.data import DATASETS, Dataset, Images, Loader
 from src.magic import Magic, TrainLog, backprop_logged, to_device
 from src.objective import LOSSES, Objective
 from src.models import MODELS
-from src.optimizers import AdamState, HeunState, LRSchedule, OptimState, SGDMomentumState, SGDState
+from src.optimizers import AdamState, HeunState, LRSchedule, NoisySGDState, OptimState, SGDMomentumState, SGDState
 from src.second_order import CentralFlowState, EdgeFlowState, NewtonState, SecondOrderState, SharpnessState
 from src.logging import Logger, fig_title
 
@@ -64,11 +64,12 @@ class ExperimentConfig:
     depth: int | None = None  # of the model (mlp: hidden layers, cnn: blocks per stage, vit: blocks; None: the model's default)
     loss: str = "ce"
     init_seed: int = 0
+    n_seeds: int = 1  # train this many models vmapped together, of init seeds init_seed, init_seed + 1, ... (first-order optimizers)
     data_seed: int = 0
     n_train: int | None = None  # train on a random subset of this many examples (seeded by data_seed; None: all)
     n_classes: int | None = None  # keep only the first this many classes of the dataset, train and test (None: all)
     batch_size: int = 32
-    optimizer: str = "sgd"  # sgd, momentum, adam, sharpness (SGD with the step size lr / top Hessian eigenvalue), newton, edgeflow, centralflow or heun
+    optimizer: str = "sgd"  # sgd, momentum, adam, sharpness (SGD with the step size lr / top Hessian eigenvalue), newton, edgeflow, centralflow, heun or noisysgd
     lr: float | None = None
     lr_schedule: str = "constant"  # or cosine, after `warmup` linear steps (models.LRSchedule)
     warmup: int = 0
@@ -112,7 +113,8 @@ class Experiment:
         data += "" if cfg.n_classes is None else f" ({cfg.n_classes} classes)"
         size = [f"{name} {value}" for name, value in (("width", cfg.width), ("depth", cfg.depth)) if value is not None]
         model = cfg.model + (f" ({', '.join(size)})" if size else "")
-        return f"{model} on {data}, {cfg.loss}, {cfg.optimizer} lr {cfg.lr:g}{schedule}, steps {cfg.start}-{cfg.n_steps}"
+        seeds = f", {cfg.n_seeds} seeds" if cfg.n_seeds > 1 else ""
+        return f"{model} on {data}, {cfg.loss}, {cfg.optimizer} lr {cfg.lr:g}{schedule}, steps {cfg.start}-{cfg.n_steps}{seeds}"
 
     def dataset(self, train: bool) -> Dataset:
         """The train / test set of the config, limited to its first `n_classes` classes"""
@@ -152,7 +154,11 @@ class Experiment:
 
     @cached_property
     def model(self) -> torch.nn.Module:
-        torch.manual_seed(self.cfg.init_seed)
+        return self.build_model(self.cfg.init_seed)
+
+    def build_model(self, init_seed: int) -> torch.nn.Module:
+        """The model of the config initialized with `init_seed`"""
+        torch.manual_seed(init_seed)
         size = {"width": self.cfg.width, "blocks" if self.cfg.model == "cnn" else "depth": self.cfg.depth}
         size = {name: value for name, value in size.items() if value is not None}
         dtype = torch.get_default_dtype()
@@ -165,12 +171,18 @@ class Experiment:
 
     @cached_property
     def init_state(self) -> OptimState:
-        """The initial state of `model` with the config's optimizer and lr schedule."""
+        """The initial state of `model` with the config's optimizer and lr schedule (n_seeds > 1: batched [n_seeds, *shape],
+        the model of each init seed)."""
         cfg = self.cfg
         if cfg.lr is None:
             raise click.UsageError(f"no learning rate in {self.dir / 'config.json'}: run experiments/tune_lr.py first")
         schedule = LRSchedule(cfg.lr, kind=cfg.lr_schedule, warmup=cfg.warmup * self.substeps, n_steps=cfg.n_steps * self.substeps)
         params = {k: p.detach().clone() for k, p in self.model.named_parameters()}
+        if cfg.n_seeds > 1:
+            if cfg.optimizer in ("sharpness", "newton", "edgeflow", "centralflow"):
+                raise click.UsageError(f"{cfg.optimizer} can't train several seeds (a second-order step can't be vmapped)")
+            seeds = [params] + [dict(self.build_model(cfg.init_seed + k).named_parameters()) for k in range(1, cfg.n_seeds)]
+            params = {k: torch.stack([p[k].detach() for p in seeds]) for k in params}
         if cfg.optimizer == "adam":
             return AdamState(params=params, lr=schedule, betas=(cfg.beta1, cfg.beta2), wd=cfg.weight_decay)
         if cfg.optimizer == "momentum":
@@ -185,6 +197,8 @@ class Experiment:
             return CentralFlowState(params=params, lr=schedule, wd=cfg.weight_decay, compile=self.compile, devices=tuple(self.helper_devices))
         if cfg.optimizer == "heun":
             return HeunState(params=params, lr=schedule, wd=cfg.weight_decay)
+        if cfg.optimizer == "noisysgd":
+            return NoisySGDState(params=params, lr=schedule, wd=cfg.weight_decay, shapes={k: tuple(p.shape) for k, p in self.model.named_parameters()})
         assert cfg.optimizer == "sgd", cfg.optimizer
         return SGDState(params=params, lr=schedule, wd=cfg.weight_decay)
 
@@ -217,6 +231,8 @@ class Experiment:
             saved["compile"] = self.compile
         if "devices" in saved:
             saved["devices"] = tuple(self.helper_devices)
+        if isinstance(self.init_state, NoisySGDState):
+            saved.setdefault("shapes", self.init_state.shapes)  # (saved before 2026-11-21: none)
         return type(self.init_state)(**saved)
 
     def checkpoints(self) -> dict[int, Path]:
@@ -253,6 +269,32 @@ class Experiment:
 def eval_set_key(indices: Tensor) -> str:
     """The key of an eval set (test indices [n]) in losses.json: <n>:<hash of the sorted indices>"""
     return f"{len(indices)}:{hashlib.sha1(indices.sort().values.to(torch.int64).cpu().numpy().tobytes()).hexdigest()[:16]}"
+
+
+def single_seed(exp_dir: Path):
+    if Experiment(exp_dir).cfg.n_seeds > 1:
+        raise click.UsageError(f"{exp_dir} trains several seeds (n_seeds): only `train` and `magic` support them")
+
+
+def extend(exp_dir: Path, n_steps: int):
+    """Make the finished run of DIR/full_model a killed one at its last step, to continue to `n_steps` (config steps): final.pt
+    becomes its checkpoint, resume.pt holds no EMA (it restarts from the params there) nor previous gradients, the logs of the
+    last step (logged again) are dropped, and the config's n_steps is `n_steps` (a cosine schedule changes). No-op if the run
+    has `n_steps` already or isn't finished"""
+    path, full_dir = exp_dir / "config.json", exp_dir / "full_model"
+    cfg = json.loads(path.read_text())
+    if cfg["n_steps"] >= n_steps or not (full_dir / "final.pt").exists():
+        return
+    last = sum(Experiment(exp_dir).steps)  # the optimizer step of final.pt
+    (full_dir / "checkpoints").mkdir(exist_ok=True)
+    shutil.copy(full_dir / "final.pt", full_dir / "checkpoints" / f"{last}.pt")
+    metrics = torch.load(full_dir / "metrics.pt", weights_only=True)
+    kept = {name: {"step": m["step"][m["step"] < last], "value": m["value"][m["step"] < last]} for name, m in metrics.items()}
+    torch.save({name: m for name, m in kept.items() if len(m["step"])}, full_dir / "metrics.pt")
+    torch.save({"step": last, "ema": None, "pema": None, "warm": {}, "prev_grads": None, "tangent": None}, full_dir / "resume.pt")
+    path.write_text(json.dumps({**cfg, "n_steps": n_steps}, indent=2))
+    (full_dir / "final.pt").unlink()
+    click.echo(f"extending {exp_dir} from step {cfg['n_steps']} to {n_steps}")
 
 
 def has_model(run_dir: Path) -> bool:
@@ -293,14 +335,15 @@ def main():
 @click.option("--dataset", type=click.Choice(list(DATASETS)), default="cifar10", show_default=True)
 @click.option("--model", type=click.Choice(list(MODELS)), default="cnn", show_default=True)
 @click.option("--loss", type=click.Choice(list(LOSSES)), default="ce", show_default=True)
-@click.option("--width", type=int, default=None, help="of the model (mlp: hidden, cnn: channels of the 1st stage, vit: embedding; default: 512 / 32 / 96; cnn 6 ~ 11k params)")
-@click.option("--depth", type=int, default=None, help="of the model (mlp: hidden layers, cnn: blocks per stage, vit: blocks; default: 2 / 1 / 3)")
+@click.option("--width", type=int, default=None, help="of the model (mlp: hidden, simple_cnn / cnn: channels of the 1st conv / stage, vit: embedding; default: 256 / 32 / 16 / 64)")
+@click.option("--depth", type=int, default=None, help="of the model (mlp: hidden layers, cnn: blocks per stage, vit: blocks; default: 2 / 3 / 3; simple_cnn: none)")
 @click.option("--init-seed", type=int, default=0, show_default=True)
+@click.option("--n-seeds", type=int, default=1, show_default=True, help="train this many models vmapped together, of init seeds init-seed, init-seed + 1, ... (first-order optimizers)")
 @click.option("--data-seed", type=int, default=0, show_default=True, help="seed of the batch order (and of the --n-train subset)")
 @click.option("--n-train", type=int, default=None, help="train on a random subset of this many examples (default: all)")
 @click.option("--n-classes", type=int, default=None, help="keep only the first this many classes, train and test (default: all)")
 @click.option("--batch-size", type=int, default=128, show_default=True)
-@click.option("--optimizer", type=click.Choice(["sgd", "momentum", "adam", "sharpness", "newton", "edgeflow", "centralflow", "heun"]), default="sgd", show_default=True, help="sharpness: SGD with the step size lr * 2 / sharpness; edgeflow: Edge Flow with GD learning rate lr; centralflow: the central flow of GD with learning rate lr (logs its own top eigenvalues); heun: 2-stage Runge-Kutta on the gradient flow")
+@click.option("--optimizer", type=click.Choice(["sgd", "momentum", "adam", "sharpness", "newton", "edgeflow", "centralflow", "heun", "noisysgd"]), default="sgd", show_default=True, help="sharpness: SGD with the step size lr * 2 / sharpness; edgeflow: Edge Flow with GD learning rate lr; centralflow: the central flow of GD with learning rate lr (logs its own top eigenvalues); heun: 2-stage Runge-Kutta on the gradient flow; noisysgd: SGD with the gradient at Gaussian-perturbed params")
 @click.option("--lr", type=float, default=None, help="learning rate (default: set by experiments/tune_lr.py)")
 @click.option("--lr-schedule", type=click.Choice(LR_SCHEDULES), default="constant", show_default=True, help=f"cosine: from lr to {LRSchedule.FINAL_FRACTION:g} lr at n_steps")
 @click.option("--warmup", type=int, default=0, show_default=True, help="linear warmup of the lr over this many steps")
@@ -337,10 +380,14 @@ def new(exp_dir: Path, **kwargs):
 @click.option("--ema-gamma", type=float, default=16.97, show_default=True, help="also log the loss and metrics of the power-function EMA of the params (Karras et al. 2024) with this exponent: 16.97 averages the last ~5% of the training (0: don't; never for centralflow)")
 @click.option("--ema-decay", type=float, default=0.9, show_default=True, help="short-term EMA of the params with this decay, the direction params - EMA of --curvature (0: don't; centralflow: only with --curvature)")
 @click.option("--checkpoint-every", type=int, default=0, show_default=True, help="save the state every this many steps (0: don't): a killed train continues from the last one, and magic replays only between them")
+@click.option("--extend-to", type=int, default=None, help="continue a finished run to this many steps in all (n_steps of the config; see `extend`)")
 @show_option
-def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every, curvature, tangent, eval_every, n_test, ema_gamma, ema_decay, checkpoint_every, show):
-    exp = Experiment(exp_dir, device, compile)
+def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every, curvature, tangent, eval_every, n_test, ema_gamma, ema_decay, checkpoint_every, extend_to, show):
     full_dir = exp_dir / "full_model"
+    if extend_to is not None:
+        assert not (force or tangent), "--extend-to continues the run: no --force or --tangent"
+        extend(exp_dir, extend_to)
+    exp = Experiment(exp_dir, device, compile)
     if (full_dir / "final.pt").exists() and not force:
         click.echo(f"{full_dir / 'final.pt'} exists (--force to retrain)")
         return
@@ -350,7 +397,7 @@ def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every
             (full_dir / name).unlink(missing_ok=True)
     if (full_dir / "resume.pt").exists():
         click.echo(f"continuing from the last checkpoint ({full_dir / 'resume.pt'})")
-    logger = Logger(exp.name, step_scale=exp.substeps, lags=(), smooth=exp.cfg.optimizer not in ["centralflow", "edgeflow"])
+    logger = Logger(exp.name, step_scale=exp.substeps, lags=(), smooth=exp.cfg.optimizer not in ["centralflow", "edgeflow"], seeds=exp.cfg.n_seeds > 1)
     if exp.cfg.optimizer == "centralflow":  # the flow does not oscillate: the EMAs (of the params, of the plotted metrics) only lag behind
         ema_gamma, ema_decay = 0, ema_decay if curvature else 0
     start, n_steps = exp.steps
@@ -383,6 +430,7 @@ def train(exp_dir, device, compile, force, num_top_eigs, num_neg_eigs, eig_every
 @click.option("--n-subsets", type=int, default=10, show_default=True, help="perturbed models per alpha (indices 0, ..., n-1)")
 @click.option("--vmap-limit", type=int, default=None, help="train at most this many models per vmapped pass (default: all at once; 1: not vmapped)")
 def retrain(exp_dir, device, compile, kind, alphas, n_subsets, vmap_limit):
+    single_seed(exp_dir)
     devices = parse_devices(device)
     if len(devices) == 1:
         return retrain_shard(exp_dir, device, compile, kind, alphas, n_subsets, vmap_limit)
@@ -428,7 +476,8 @@ def plot_examples(exp: Experiment, subset_dir: Path, k: int = 5):
     if not isinstance(train_ds, Images):
         return
     lin = load_renamed(subset_dir / "linearization.pt")
-    d_weights = lin["d_weights"]
+    seeds = lin["output"].numel()  # (several seeds: their mean is plotted)
+    output, d_weights = lin["output"].mean(), lin["d_weights"].reshape(seeds, -1).mean(0)
     order = d_weights.argsort()
     rows = [("eval set (test examples)", test_ds, lin["indices"]),
             (f"most helpful training examples (lowest df/dw: upweighting lowers f)", train_ds, order[:k]),
@@ -445,15 +494,16 @@ def plot_examples(exp: Experiment, subset_dir: Path, k: int = 5):
             ax.imshow(img.squeeze(-1) if img.shape[-1] == 1 else img, cmap="gray" if img.shape[-1] == 1 else None)
             label = f"{ds.classes[ds.labels[i]]} #{ds.ids[i].item()}"
             ax.set_title(label if ds is test_ds else f"{label}\n{d_weights[i].item():.3g}", fontsize=7)
-    fig_title(fig, f"MAGIC df/dw, f = {lin['output'].item():.4f}; {exp.name}")
+    fig_title(fig, f"MAGIC df/dw, f = {output.item():.4f}" + (f" (mean of {seeds} seeds)" if seeds > 1 else "") + f"; {exp.name}")
     fig.savefig(subset_dir / "examples.png", dpi=150)
 
 
 @main.command(help="Compute df/dw (MAGIC) for the loss f of the trained full model (`train` first) on each eval set, "
               "for the training weights of the steps from `start` on. "
               "Saves to DIR/magic (linearization.pt per eval set; metrics.pt and "
-              "plots of f(s_t), the norms of df/ds_t and df/dw_t; per eval set, examples.png: its images and the training images with the "
-              "lowest / highest df/dw); existing eval sets are skipped. The backward goes from each checkpoint of `train` to the next, "
+              "plots of f(s_t), |df/ds_t| and |df/dw_t|; per eval set, examples.png: its images and the training images with the "
+              "lowest / highest df/dw); existing eval sets are skipped. Several seeds (n_seeds): all at once, df/dw [n_seeds, N] "
+              "(examples.png plots their mean). The backward goes from each checkpoint of `train` to the next, "
               "and a killed run continues from the last one it reached.")
 @exp_dir
 @device_option
@@ -474,12 +524,13 @@ def magic(exp_dir, device, compile, n_test, n_subsets, passes, show):
     if todo:
         indices = [exp.test_ds.subset(n_test, index=i) for i in todo]  # the test examples of each eval set
         click.echo(f"backpropagating {len(todo)} eval sets")
-        logger = Logger(f"MAGIC: df/ds_t and df/dw_t; {exp.name}", smooth=False, split_norms=True, step_scale=exp.substeps)
+        seeds = exp.cfg.n_seeds > 1
+        logger = Logger(f"MAGIC: df/ds_t and df/dw_t; {exp.name}", smooth=False, step_scale=exp.substeps, lags=(), seeds=seeds)
         eval_sets = [exp.test_ds.examples(idx) for idx in indices]
         final = exp.load_state(final_path)
-        outputs, f_grads = exp.objective.eval_grads(to_device(final.params, exp.device), eval_sets)  # f(s_T) [#fns]
+        outputs, f_grads = exp.objective.eval_grads(to_device(final.params, exp.device), eval_sets)  # f(s_T) [#fns, (n_seeds,)]
         d_state = final.cotangent(f_grads)  # df/ds_T
-        d_weights = torch.zeros(len(todo), len(exp.train_ds))  # df/dw [#fns, N]
+        d_weights = torch.zeros(len(todo), *exp.objective.model_dims(final.params), len(exp.train_ds))  # df/dw [#fns, (n_seeds,) N]
         checkpoints = exp.checkpoints()
         bounds = [start, *checkpoints, start + n_steps]
         resume_path, names = magic_dir / "resume.pt", [d.name for d in todo.values()]
@@ -500,7 +551,7 @@ def magic(exp_dir, device, compile, n_test, n_subsets, passes, show):
         for (i, d), idx, output, fn_d_weights in zip(todo.items(), indices, outputs, d_weights):
             d.mkdir(parents=True, exist_ok=True)
             torch.save({"indices": idx, "output": output.cpu(), "d_weights": fn_d_weights}, d / "linearization.pt")
-            click.echo(f"  {n_test} examples #{i}: f = {output.item():.4f}")
+            click.echo(f"  {n_test} examples #{i}: f = " + ", ".join(f"{f:.4f}" for f in output.flatten().tolist()))
         logger.finish(magic_dir / "metrics.pt")
         resume_path.unlink()
     for d in dirs.values():

@@ -9,8 +9,8 @@ from src.data import Dataset, Loader, Majority
 from src.objective import cross_entropy, hvp_from_grads, Objective
 from src.lobpcg import hessian_eigs
 from src.magic import Magic, TrainLog, backprop_logged
-from src.models import MLP, Linear, ResNet, ViT
-from src.optimizers import AdamState, HeunState, LRSchedule, SGDMomentumState, SGDState
+from src.models import MLP, Linear, ResNet, SimpleCNN, ViT
+from src.optimizers import AdamState, HeunState, LRSchedule, NoisySGDState, SGDMomentumState, SGDState
 from src.second_order import CentralFlowState, EdgeFlowState, NewtonState, SharpnessState
 from src.logging import Logger, scaled_l2
 
@@ -27,6 +27,8 @@ def setup(optimizer: str, **kwargs):
         state = SGDMomentumState(params=params, lr=LRSchedule(0.1), wd=0.01, momentum=0.9)
     elif optimizer == "heun":
         state = HeunState(params=params, lr=LRSchedule(0.1), wd=0.01, eps=0.5)
+    elif optimizer == "noisysgd":
+        state = NoisySGDState(params=params, lr=LRSchedule(0.1), wd=0.01, EPS=0.1)
     elif optimizer == "sharpness":
         state = SharpnessState(params=params, lr=LRSchedule(1.0), wd=0.01)
     elif optimizer == "edgeflow":
@@ -66,7 +68,7 @@ def test_replay_reconstructs_training(n_steps, passes):
             assert torch.equal(x, y)
 
 
-@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam", "heun", "sharpness", "edgeflow"])
+@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam", "heun", "noisysgd", "sharpness", "edgeflow"])
 def test_magic_matches_autograd_through_training(optimizer, float64):
     """MAGIC's df/dw must equal autograd through the whole unrolled training (for the sharpness step: through the
     Rayleigh quotient of the detached eigenvector, the same expression)."""
@@ -140,7 +142,7 @@ def test_centralflow_stateful_step_matches_func(float64, monkeypatch):
         torch.testing.assert_close(getattr(func, name), getattr(stateful, name), rtol=1e-10, atol=1e-12)
 
 
-@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam"])
+@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam", "noisysgd"])
 def test_train_batched_matches_single(optimizer, float64):
     """Training R weightings at once (vmap) gives the same states as training them one by one."""
     magic, train_ds, _, state = setup(optimizer)
@@ -156,6 +158,23 @@ def test_train_batched_matches_single(optimizer, float64):
         for a, b in zip([single, *single_ckpts], [batched, *ckpts]):
             for x, y in zip(a, b):
                 torch.testing.assert_close(x, y[r])
+
+
+@pytest.mark.parametrize("optimizer", ["sgd", "momentum", "adam", "noisysgd"])
+def test_magic_batched_matches_single(optimizer, float64):
+    """MAGIC through R models trained at once (a batched state, vmapped) = through each one alone."""
+    magic, _, test_loader, state = setup(optimizer)
+    eval_sets = [test_loader.dataset.examples(idx) for idx in (torch.arange(10), torch.arange(20, 50))]
+    gen = torch.Generator().manual_seed(0)
+    perturbed = {k: p + 0.1 * torch.randn(p.shape, generator=gen, dtype=p.dtype) for k, p in state.params.items()}
+    states = [state, replace(state, params=perturbed)]  # two inits
+    batched = state.unflatten([torch.stack(tensors) for tensors in zip(*states)])
+    outputs, d_weights = backprop(magic, batched, 5, eval_sets)
+    assert outputs.shape == (2, 2) and d_weights.shape[:2] == (2, 2)
+    for r, single in enumerate(states):
+        single_outputs, single_d_weights = backprop(magic, single, 5, eval_sets)
+        torch.testing.assert_close(outputs[:, r], single_outputs)
+        torch.testing.assert_close(d_weights[:, r], single_d_weights)
 
 
 @pytest.mark.parametrize("optimizer", ["momentum", "adam"])
@@ -393,7 +412,7 @@ class Noise(Dataset):
         return self.X[idx], self.labels[idx]
 
 
-@pytest.mark.parametrize("model_cls, kwargs", [(ResNet, dict(width=4)), (ViT, dict(width=8, head_dim=4, depth=1))])
+@pytest.mark.parametrize("model_cls, kwargs", [(SimpleCNN, dict(width=4)), (ResNet, dict(width=4)), (ViT, dict(width=8, head_dim=4, depth=1))])
 def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     """Double backward (through the loss and the step) and LOBPCG (needed for the logged metrics and MAGIC) work through the models."""
     train_ds, test_ds = Noise((3, 8, 8)), Noise((3, 8, 8), seed=1)
@@ -413,7 +432,7 @@ def test_models_support_logging_and_magic(model_cls, kwargs, tmp_path):
     metrics = torch.load(tmp_path / "metrics.pt", weights_only=True)
     assert all(torch.isfinite(m["value"]).all() for m in metrics.values())
     assert {"loss", "acc", "eig/1", "eig/2", "test_loss", "test_acc", "params/out.weight",
-            "grads/out.bias", "tangent/params/out.weight", "d_state/0/params/out.weight", "d_weights/0"} <= set(metrics)
+            "grads/out.bias", "tangent/params/out.weight", "d_state/0", "d_weights/0"} <= set(metrics)
     assert d_weights.shape == (1, len(train_ds)) and torch.isfinite(d_weights).all() and (d_weights != 0).any()
     assert (tmp_path / "metrics.png").exists() and (tmp_path / "metrics_norms.png").exists()
 

@@ -98,8 +98,12 @@ class OptimState:
         """The state after step `t` with the gradients `grads`"""
         raise NotImplementedError
 
-    def vjp(self, t: int, forward_fn: Forward, inputs: Sequence[Tensor], cotangents: "OptimState", next_state: "OptimState | None" = None) -> Sequence[Tensor]:
-        """Backward of `step`: d(next_state)/d(inputs) at `cotangents` (batched); `next_state` = what `step` returned (detached), if known"""
+    def vjp(
+        self, t: int, forward_fn: Forward, inputs: Sequence[Tensor],
+        cotangents: "OptimState", next_state: "OptimState | None" = None,
+    ) -> Sequence[Tensor]:
+        """Backward of `step`: d(next_state)/d(inputs) at `cotangents` (batched)
+        `next_state` = what `step` returned (detached), if known"""
         stepped = self.step(t, forward_fn, create_graph=True)[0]
         return torch.autograd.grad(list(stepped), inputs, list(cotangents), is_grads_batched=True)
 
@@ -125,6 +129,31 @@ class SGDState(OptimState):
     @property
     def stability_threshold(self) -> float:
         return 2.0
+
+
+@dataclass(kw_only=True)
+class NoisySGDState(SGDState):
+    """SGD with the gradient at `params + EPS * N(0, 1)`"""
+
+    EPS: float = 0.01  # noise level
+    shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)  # of one model's params (for the noise)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.shapes:
+            self.shapes = {k: tuple(p.shape) for k, p in self.params.items()}
+
+    def step(self, t: int, forward_fn: Forward, create_graph: bool = False) -> tuple[Self, *StepOutput]:
+        """Step `t` on the loss of `forward_fn` (one loss per model if the state is batched)"""
+        device = next(iter(self.params.values())).device
+        gen = torch.Generator(device).manual_seed(t)
+        params = {
+            k: p + self.EPS * torch.randn(self.shapes[k], generator=gen, device=device, dtype=p.dtype)
+            for k, p in self.params.items()
+        }
+        loss, out = forward_fn(params)  # () or (#models,)
+        grads = torch.autograd.grad(loss.sum(), params, create_graph=create_graph)
+        return self._update(t, grads), grads, loss, out
 
 
 @dataclass(kw_only=True)
